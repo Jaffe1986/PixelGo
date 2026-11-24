@@ -1,13 +1,8 @@
 package com.pixelgo.data
 
-import com.pixelgo.model.Frame
-import com.pixelgo.model.FrameCursor
-import com.pixelgo.model.Layer
 import com.pixelgo.model.MAX_CANVAS_SIZE
-import com.pixelgo.model.MAX_FRAMES
 import com.pixelgo.model.MAX_LAYERS
 import com.pixelgo.model.Palette
-import com.pixelgo.model.PixelProject
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
@@ -17,54 +12,104 @@ import java.nio.ByteBuffer
 import java.util.zip.DeflaterOutputStream
 import java.util.zip.InflaterInputStream
 
-/** Info shown in the gallery, readable without decompressing the pixel data. */
-data class ProjectHeader(
+/** A project in the old single-file `.pxg` format (everything in memory). */
+class LegacyLayer(val id: Long, val name: String, val visible: Boolean, val cels: List<IntArray>)
+
+class LegacyProject(
     val name: String,
     val width: Int,
     val height: Int,
     val modified: Long,
-    val frameCount: Int,
-    val version: Int,
+    val fps: Int,
+    val holds: IntArray,
+    val currentFrame: Int,
+    val activeLayer: Int,
+    val nextLayerId: Long,
+    val layers: List<LegacyLayer>,
 )
 
 /**
- * .pxg file format.
+ * Old `.pxg` format (v1 = still image, v2 = animation). Only read when migrating to the
+ * folder format (v3, see [MetaSerializer]); [write] exists to build test fixtures.
  *
- * Header (uncompressed):
- *   int magic, int version, UTF name, int width, int height, long modified
- *   [v2+] int frameCount
- *
+ * Header: int magic "PXGO", int version, UTF name, int width, int height, long modified,
+ *         [v2] int frameCount
  * Body (deflate):
  *   v1: int activeLayer, long nextLayerId, int layerCount,
- *       layerCount x [ long id, UTF name, boolean visible, int[w*h] pixels ]
- *   v2: int activeLayer, long nextLayerId, int fps, int currentFrame,
- *       frameCount x [ int hold ],
- *       int layerCount, layerCount x [ long id, UTF name, boolean visible, frameCount x int[w*h] ]
+ *       layerCount × [long id, UTF name, boolean visible, int[w*h]]
+ *   v2: int activeLayer, long nextLayerId, int fps, int currentFrame, frameCount × int hold,
+ *       int layerCount, layerCount × [long id, UTF name, boolean visible, frameCount × int[w*h]]
  */
-object ProjectSerializer {
-    private const val MAGIC = 0x5058474F // "PXGO"
-    private const val VERSION = 2
+object LegacyPxg {
+    const val MAGIC = 0x5058474F // "PXGO"
+    const val LEGACY_MAX_FRAMES = 128
 
-    fun write(project: PixelProject, modified: Long, out: OutputStream) {
+    fun read(input: InputStream): LegacyProject {
+        val d = DataInputStream(input)
+        if (d.readInt() != MAGIC) throw IOException("Not a PixelGo project")
+        val version = d.readInt()
+        if (version !in 1..2) throw IOException("Unsupported project version $version")
+        val name = d.readUTF()
+        val w = d.readInt()
+        val h = d.readInt()
+        if (w !in 1..MAX_CANVAS_SIZE || h !in 1..MAX_CANVAS_SIZE) throw IOException("Bad size")
+        val modified = d.readLong()
+        val frameCount = if (version >= 2) d.readInt() else 1
+        if (frameCount !in 1..LEGACY_MAX_FRAMES) throw IOException("Bad frame count")
+
+        val body = DataInputStream(InflaterInputStream(input))
+        val active = body.readInt()
+        val nextId = body.readLong()
+        var fps = 8
+        var current = 0
+        val holds = if (version >= 2) {
+            fps = body.readInt().coerceIn(1, 60)
+            current = body.readInt()
+            IntArray(frameCount) { body.readInt().coerceAtLeast(1) }
+        } else {
+            intArrayOf(1)
+        }
+        val count = body.readInt()
+        if (count !in 1..MAX_LAYERS) throw IOException("Bad layer count")
+        val size = w * h
+        val bytes = ByteArray(size * 4)
+        val layers = List(count) {
+            val lid = body.readLong()
+            val lname = body.readUTF()
+            val visible = body.readBoolean()
+            val cels = List(frameCount) {
+                body.readFully(bytes)
+                IntArray(size).also { px -> ByteBuffer.wrap(bytes).asIntBuffer().get(px) }
+            }
+            LegacyLayer(lid, lname, visible, cels)
+        }
+        return LegacyProject(
+            name, w, h, modified, fps, holds,
+            current.coerceIn(0, frameCount - 1), active.coerceIn(0, count - 1), nextId, layers,
+        )
+    }
+
+    /** Writes the v2 format (for tests). */
+    fun write(p: LegacyProject, out: OutputStream) {
         val d = DataOutputStream(out)
         d.writeInt(MAGIC)
-        d.writeInt(VERSION)
-        d.writeUTF(project.name)
-        d.writeInt(project.width)
-        d.writeInt(project.height)
-        d.writeLong(modified)
-        d.writeInt(project.frames.size)
+        d.writeInt(2)
+        d.writeUTF(p.name)
+        d.writeInt(p.width)
+        d.writeInt(p.height)
+        d.writeLong(p.modified)
+        d.writeInt(p.holds.size)
         d.flush()
         val z = DeflaterOutputStream(out)
         val body = DataOutputStream(z)
-        body.writeInt(project.activeLayerIndex)
-        body.writeLong(project.nextLayerId)
-        body.writeInt(project.fps)
-        body.writeInt(project.currentFrame)
-        project.frames.forEach { body.writeInt(it.hold) }
-        body.writeInt(project.layers.size)
-        val buf = ByteBuffer.allocate(project.size * 4)
-        for (layer in project.layers) {
+        body.writeInt(p.activeLayer)
+        body.writeLong(p.nextLayerId)
+        body.writeInt(p.fps)
+        body.writeInt(p.currentFrame)
+        p.holds.forEach { body.writeInt(it) }
+        body.writeInt(p.layers.size)
+        val buf = ByteBuffer.allocate(p.width * p.height * 4)
+        for (layer in p.layers) {
             body.writeLong(layer.id)
             body.writeUTF(layer.name)
             body.writeBoolean(layer.visible)
@@ -77,58 +122,6 @@ object ProjectSerializer {
         body.flush()
         z.finish()
         out.flush()
-    }
-
-    fun readHeader(input: InputStream): ProjectHeader {
-        val d = DataInputStream(input)
-        if (d.readInt() != MAGIC) throw IOException("Not a PixelGo project")
-        val version = d.readInt()
-        if (version !in 1..VERSION) throw IOException("Unsupported project version $version")
-        val name = d.readUTF()
-        val w = d.readInt()
-        val h = d.readInt()
-        if (w !in 1..MAX_CANVAS_SIZE || h !in 1..MAX_CANVAS_SIZE) throw IOException("Bad size")
-        val modified = d.readLong()
-        val frames = if (version >= 2) d.readInt() else 1
-        if (frames !in 1..MAX_FRAMES) throw IOException("Bad frame count")
-        return ProjectHeader(name, w, h, modified, frames, version)
-    }
-
-    fun read(id: String, input: InputStream): PixelProject {
-        val header = readHeader(input)
-        val body = DataInputStream(InflaterInputStream(input))
-        val active = body.readInt()
-        val nextId = body.readLong()
-        var fps = 8
-        var current = 0
-        val frames = if (header.version >= 2) {
-            fps = body.readInt().coerceIn(1, 60)
-            current = body.readInt()
-            MutableList(header.frameCount) { Frame(body.readInt().coerceIn(1, 99)) }
-        } else {
-            mutableListOf(Frame())
-        }
-        val count = body.readInt()
-        if (count !in 1..MAX_LAYERS) throw IOException("Bad layer count")
-        val size = header.width * header.height
-        val bytes = ByteArray(size * 4)
-        val cursor = FrameCursor()
-        val layers = MutableList(count) {
-            val lid = body.readLong()
-            val lname = body.readUTF()
-            val visible = body.readBoolean()
-            val cels = MutableList(frames.size) {
-                body.readFully(bytes)
-                IntArray(size).also { px -> ByteBuffer.wrap(bytes).asIntBuffer().get(px) }
-            }
-            Layer(lid, lname, visible, cels, cursor)
-        }
-        val p = PixelProject(
-            id, header.name, header.width, header.height, cursor, layers, frames,
-            active.coerceIn(0, count - 1), nextId, fps,
-        )
-        p.currentFrame = current
-        return p
     }
 }
 

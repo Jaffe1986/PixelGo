@@ -16,14 +16,15 @@ class Clip(
 }
 
 /**
- * Cells floating above the canvas while being moved or pasted.
- * [lifted] holds the original values of cells cleared by a move (null for a paste).
+ * Cells floating above the canvas while being moved or pasted, on layer [layerId] of frame
+ * [frameUid]. [lifted] holds the original values of cells cleared by a move (null for a paste).
  */
 class Floating(
     val clip: Clip,
     var x: Int,
     var y: Int,
     val layerId: Long,
+    val frameUid: Long,
     val lifted: Map<Int, Int>?,
     val previousSelection: BooleanArray?,
 )

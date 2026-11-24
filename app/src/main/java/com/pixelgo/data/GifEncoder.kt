@@ -11,13 +11,13 @@ import java.io.OutputStream
  * - If the art has more than 255 distinct colors, the 255 most common are kept and the rest
  *   map to the nearest of those.
  * - Frames are scaled up with nearest-neighbour by [scale] and loop forever.
+ * - Frames are pulled one at a time from a provider, so animations of any length can be
+ *   encoded without holding every frame in memory (the provider is called twice per frame:
+ *   once to build the palette, once to encode).
  */
 object GifEncoder {
 
-    /**
-     * @param frames one ARGB array (width*height) per frame, at 1x
-     * @param delaysCs per-frame display time in 1/100 s
-     */
+    /** Convenience overload for in-memory frames (tests). */
     fun encode(
         frames: List<IntArray>,
         width: Int,
@@ -25,9 +25,24 @@ object GifEncoder {
         scale: Int,
         delaysCs: List<Int>,
         out: OutputStream,
+    ) = encode(frames.size, { frames[it] }, width, height, scale, delaysCs.toIntArray(), out)
+
+    /**
+     * @param frame returns frame i as ARGB (width*height) at 1x
+     * @param delaysCs per-frame display time in 1/100 s (see [delaysCs])
+     */
+    fun encode(
+        frameCount: Int,
+        frame: (Int) -> IntArray,
+        width: Int,
+        height: Int,
+        scale: Int,
+        delaysCs: IntArray,
+        out: OutputStream,
+        progress: (Float) -> Unit = {},
     ) {
-        require(frames.isNotEmpty() && frames.size == delaysCs.size)
-        val palette = buildPalette(frames)
+        require(frameCount > 0 && frameCount == delaysCs.size)
+        val palette = buildPalette(frameCount) { i -> frame(i).also { progress(0.3f * (i + 1) / frameCount) } }
         val transparent = palette.size          // index after the real colors
         var bits = 1
         while ((1 shl bits) < palette.size + 1) bits++
@@ -55,7 +70,9 @@ object GifEncoder {
         val small = ByteArray(width * height)
         val big = ByteArray(ow * oh)
 
-        frames.forEachIndexed { fi, px ->
+        for (fi in 0 until frameCount) {
+            val px = frame(fi)
+            progress(0.3f + 0.7f * (fi + 1) / frameCount)
             // Index at 1x
             for (i in px.indices) {
                 val c = px[i]
@@ -85,16 +102,38 @@ object GifEncoder {
     }
 
     /** Opaque RGB colors (alpha >= 128), most frequent first, at most 255. */
-    fun buildPalette(frames: List<IntArray>): IntArray {
-        val counts = HashMap<Int, Int>()
-        for (px in frames) for (c in px) {
-            if ((c ushr 24) >= 128) {
-                val rgb = c and 0xFFFFFF
-                counts[rgb] = (counts[rgb] ?: 0) + 1
+    fun buildPalette(frames: List<IntArray>): IntArray = buildPalette(frames.size) { frames[it] }
+
+    fun buildPalette(frameCount: Int, frame: (Int) -> IntArray): IntArray {
+        val counts = HashMap<Int, Long>()
+        for (fi in 0 until frameCount) {
+            for (c in frame(fi)) {
+                if ((c ushr 24) >= 128) {
+                    val rgb = c and 0xFFFFFF
+                    counts[rgb] = (counts[rgb] ?: 0L) + 1
+                }
             }
         }
         val sorted = counts.entries.sortedByDescending { it.value }.map { it.key }
         return if (sorted.isEmpty()) intArrayOf(0) else sorted.take(255).toIntArray()
+    }
+
+    /**
+     * Per-frame delays in 1/100 s for frames held [holds] ticks at [fps]. GIF delays are whole
+     * hundredths, so the rounding error is carried forward to keep the total length right.
+     * Delays under 2 are raised to 2 (browsers slow tiny delays down to 0.1 s).
+     */
+    fun delaysCs(holds: IntArray, fps: Int): IntArray {
+        val out = IntArray(holds.size)
+        var exact = 0.0
+        var emitted = 0L
+        for (i in holds.indices) {
+            exact += holds[i] * 100.0 / fps
+            val d = (Math.round(exact) - emitted).toInt().coerceAtLeast(2)
+            out[i] = d
+            emitted += d
+        }
+        return out
     }
 
     private fun nearest(palette: IntArray, c: Int): Int {

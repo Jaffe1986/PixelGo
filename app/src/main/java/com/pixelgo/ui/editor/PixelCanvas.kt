@@ -97,7 +97,7 @@ fun PixelCanvas(vm: EditorViewModel, modifier: Modifier = Modifier) {
         drawCheckerboard(rect, if (sx >= 24f) sx / 2f else 12f, screen)
         val playing = vm.isPlaying
         if (playing) {
-            vm.playImages.getOrNull(vm.playIndex)?.let {
+            vm.playImage?.let {
                 drawImage(it, dstOffset = origin, dstSize = dst, filterQuality = FilterQuality.None)
             }
         } else {

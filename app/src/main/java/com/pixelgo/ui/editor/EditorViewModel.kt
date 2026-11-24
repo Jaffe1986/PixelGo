@@ -1,6 +1,8 @@
 package com.pixelgo.ui.editor
 
 import android.graphics.Bitmap
+import android.util.LruCache
+import android.widget.Toast
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -11,23 +13,60 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.pixelgo.PixelGoApp
+import com.pixelgo.data.DiskCelStore
+import com.pixelgo.data.ExportImage
+import com.pixelgo.data.GifEncoder
+import com.pixelgo.data.MetaSerializer
+import com.pixelgo.data.PngExporter
+import com.pixelgo.data.SaveSnapshot
+import androidx.compose.runtime.mutableLongStateOf
+import com.pixelgo.data.audio.AudioDecoder
+import com.pixelgo.data.audio.AudioRecorder
+import com.pixelgo.data.audio.AudioSources
+import com.pixelgo.data.audio.PcmFile
+import com.pixelgo.data.audio.Peaks
+import com.pixelgo.editor.AudioMixer
+import com.pixelgo.editor.CountIn
+import com.pixelgo.editor.Names
+import com.pixelgo.model.AudioAsset
+import com.pixelgo.model.FRAMES_PER_MS
+import com.pixelgo.data.video.VideoExporter
+import com.pixelgo.data.video.VideoOutput
+import com.pixelgo.data.video.VideoSettings
+import com.pixelgo.editor.AnimationSnapshot
+import com.pixelgo.editor.BulkJob
+import com.pixelgo.export.ExportJobs
+import com.pixelgo.editor.CelKey
+import com.pixelgo.editor.CelStore
+import com.pixelgo.editor.ColorMath
+import com.pixelgo.editor.DirtyCel
+import com.pixelgo.editor.EditorEngine
+import com.pixelgo.editor.FramePosition
+import com.pixelgo.editor.SelectionMath
+import com.pixelgo.editor.Timing
+import com.pixelgo.model.Frame
+import com.pixelgo.model.MAX_FPS
+import com.pixelgo.model.MIN_FPS
+import com.pixelgo.model.PixelProject
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import com.pixelgo.PixelGoApp
-import com.pixelgo.data.ExportImage
-import com.pixelgo.data.PngExporter
-import android.widget.Toast
-import com.pixelgo.editor.EditorEngine
-import com.pixelgo.editor.ColorMath
-import com.pixelgo.editor.SelectionMath
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 enum class Tool { Pencil, Eraser, Fill, Eyedropper, Select }
 
 enum class SelectMode { Rect, Paint }
+
+enum class LoadState { Loading, Ready, Failed }
+
+enum class RecordState { Idle, CountIn, Recording }
 
 /** Zoom / pan state. [scale] is screen pixels per art pixel; [offset] is the canvas top-left on screen. */
 class Viewport {
@@ -64,21 +103,34 @@ class Viewport {
     }
 }
 
-class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewModel() {
-    private val project = app.projects.load(projectId)
-    val engine: EditorEngine? = project?.let { EditorEngine(it) }
+/** Frames to export: [count] frames, [render] returns frame i flattened (call off the main thread). */
+class FrameSource(val count: Int, val render: (Int) -> IntArray)
 
-    val width = project?.width ?: 1
-    val height = project?.height ?: 1
+class EditorViewModel(private val app: PixelGoApp, private val projectId: String) : ViewModel() {
 
-    private val bitmap: Bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    val image: ImageBitmap = bitmap.asImageBitmap()
+    var loadState by mutableStateOf(LoadState.Loading)
+        private set
+
+    /** Set once the project has loaded. */
+    var engine: EditorEngine? = null
+        private set
+    private var store: DiskCelStore? = null
+    private val project: PixelProject? get() = engine?.project
+
+    var width = 1
+        private set
+    var height = 1
+        private set
+
+    private var bitmap: Bitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+    var image: ImageBitmap = bitmap.asImageBitmap()
+        private set
 
     /** Bumped whenever [image] changes, so the canvas redraws. */
     var renderTick by mutableIntStateOf(0)
         private set
 
-    /** Bumped whenever layers or project info change, so lists refresh. */
+    /** Bumped whenever layers, frames or project info change, so lists refresh. */
     var structureTick by mutableIntStateOf(0)
         private set
 
@@ -122,15 +174,21 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
         private set
     var canRedo by mutableStateOf(false)
         private set
-    var projectName by mutableStateOf(project?.name ?: "")
+    var projectName by mutableStateOf("")
+        private set
+
+    /** Non-null while a long job runs (editing is blocked); shown in an overlay. */
+    var busyLabel by mutableStateOf<String?>(null)
+        private set
+    var busyProgress by mutableFloatStateOf(0f)
         private set
 
     // ---- Animation state ---------------------------------------------------------------
-    var frameIndex by mutableIntStateOf(project?.currentFrame ?: 0)
+    var frameIndex by mutableIntStateOf(0)
         private set
-    var frameCount by mutableIntStateOf(project?.frames?.size ?: 1)
+    var frameCount by mutableIntStateOf(1)
         private set
-    var fps by mutableIntStateOf(project?.fps ?: 8)
+    var fps by mutableIntStateOf(8)
         private set
     var onionSkin by mutableStateOf(false)
         private set
@@ -145,26 +203,116 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
         private set
     var playIndex by mutableIntStateOf(0)
         private set
-    var playImages: List<ImageBitmap> = emptyList()
+
+    /**
+     * Where playback is on the timeline, in ticks from the start. Unlike [playIndex], this keeps
+     * going while the animation repeats under a longer sound.
+     */
+    var playTick by mutableLongStateOf(0L)
+        private set
+
+    /** The frame image shown while playing. */
+    var playImage: ImageBitmap? = null
         private set
     private var playJob: Job? = null
     private var ignoreGesture = false
+
+    /** Small frame thumbnails for the timeline, keyed by frame uid + content versions. */
+    private val thumbCache = LruCache<String, ImageBitmap>(400)
 
     private var unsaved = false
     private var pendingX = 0
     private var pendingY = 0
 
     init {
-        syncBitmap()
+        viewModelScope.launch {
+            val opened = withContext(app.projects.dispatcher) { app.projects.open(projectId) }
+            if (opened == null) {
+                loadState = LoadState.Failed
+                return@launch
+            }
+            val p = opened.project
+            store = opened.store
+            width = p.width
+            height = p.height
+            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            image = bitmap.asImageBitmap()
+            engine = EditorEngine(p, opened.store)
+            projectName = p.name
+            fps = p.fps
+            syncBitmap()
+            syncFrames()
+            loadState = LoadState.Ready
+        }
+    }
+
+    /** True while this project's video export runs (editing is locked until it ends). */
+    val isExporting: Boolean get() = ExportJobs.isExporting(projectId)
+
+    val isBusy: Boolean get() = busyLabel != null || isExporting
+
+    /** Encoder settings preview for the export dialog (size, duration, bitrate). */
+    fun videoPreview(settings: VideoSettings): VideoExporter? {
+        val e = engine ?: return null
+        val st = store ?: return null
+        val p = e.project
+        // A mixer without sources is enough to know whether there is any sound.
+        val mixer = AudioMixer(p.tracks, p.clips) { null }
+        return VideoExporter(AnimationSnapshot.of(p, st), settings, mixer, p.totalMs())
+    }
+
+    /**
+     * Exports the animation as an MP4/MOV video in the background (see ExportJobs). Editing is
+     * locked while it runs; it keeps going if the user leaves the app.
+     */
+    fun startVideoExport(settings: VideoSettings) {
+        val e = engine ?: return
+        val st = store ?: return
+        if (isBusy || ExportJobs.isRunning) return
+        stopPlaying()
+        e.cancelStroke()
+        commitFloating()
+        unsaved = true
+        save()
+        val p = e.project
+        val snap = AnimationSnapshot.of(p, st)
+        val tracks = p.tracks.toList()
+        val clips = p.clips.toList()
+        val totalMs = p.totalMs()
+        val audioDir = app.projects.audioDir(projectId)
+        val name = projectName
+        val ctx: PixelGoApp = app
+        viewModelScope.launch {
+            withContext(app.projects.dispatcher) {} // let the save finish first
+            ExportJobs.start(
+                ctx, projectId,
+                if (settings.mov) "Exporting MOV video…" else "Exporting MP4 video…",
+                if (settings.mov) "video/quicktime" else "video/mp4",
+            ) { progress, cancelled ->
+                val target = VideoOutput.create(ctx, name, settings.mov)
+                try {
+                    AudioSources(audioDir).use { sources ->
+                        val mixer = AudioMixer(tracks, clips) { sources.get(it) }
+                        VideoExporter(snap, settings, mixer, totalMs).run(target.pfd.fileDescriptor, progress, cancelled)
+                    }
+                    if (settings.mov) VideoOutput.patchToMov(target)
+                    VideoOutput.finish(ctx, target)
+                    target.displayPath to target.uri
+                } catch (t: Throwable) {
+                    VideoOutput.discard(ctx, target)
+                    throw t
+                }
+            }
+        }
     }
 
     // ---- Frames --------------------------------------------------------------------------
 
-    fun frames() = project?.frames.orEmpty()
+    fun frames(): List<Frame> = project?.frames.orEmpty()
 
     fun selectFrame(i: Int) {
         val e = engine ?: return
-        if (i == e.project.currentFrame) return
+        if (isBusy || i == e.project.currentFrameIndex) return
         stopPlaying()
         e.cancelStroke()
         commitFloating()
@@ -175,16 +323,155 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
         structureTick++
     }
 
-    fun addFrame() = frameOp { it.addFrame() }
-    fun duplicateFrame() = frameOp { it.duplicateFrame() }
+    fun addFrame(position: FramePosition = FramePosition.AFTER) = frameOp { it.addFrame(position) }
+
+    /** Duplicates the current frame; by default it goes where the user's setting says. */
+    fun duplicateFrame(toEnd: Boolean = app.settings.duplicateToEnd) = frameOp { it.duplicateFrame(toEnd) }
+
     fun deleteFrame() = frameOp { it.deleteFrame() }
     fun moveFrame(from: Int, to: Int) = frameOp { it.moveFrame(from, to) }
     fun setFrameHold(i: Int, hold: Int) = frameOp { it.setFrameHold(i, hold) }
 
-    val canAddFrame get() = engine?.canAddFrame == true
+    val duplicateToEnd: Boolean get() = app.settings.duplicateToEnd
+    fun updateDuplicateToEnd(value: Boolean) = app.settings.updateDuplicateToEnd(value)
+
+    fun timing(): Timing? = project?.timing
+
+    // ---- Frame ranges ------------------------------------------------------------------
+
+    /** Range mode: taps on the timeline pick a run of frames instead of one frame. */
+    var rangeMode by mutableStateOf(false)
+        private set
+    var rangeStart by mutableIntStateOf(-1)
+        private set
+    var rangeEnd by mutableIntStateOf(-1)
+        private set
+    private var rangeAnchor = -1
+
+    val hasRange: Boolean get() = rangeStart >= 0
+    val rangeCount: Int get() = if (hasRange) rangeEnd - rangeStart + 1 else 0
+
+    /** Frames copied (in any project) and ready to paste. */
+    val frameClipInfo get() = app.frameClipInfo
+
+    fun toggleRangeMode() {
+        rangeMode = !rangeMode
+        if (rangeMode) startRangeAt(frameIndex) else clearRange()
+    }
+
+    /** Enters range mode with a one-frame range at [i]. */
+    fun startRangeAt(i: Int) {
+        rangeMode = true
+        rangeAnchor = i
+        setRange(i, i)
+    }
+
+    /** In range mode, a tap extends the range from the first tapped frame to this one. */
+    fun tapFrameInRange(i: Int) {
+        if (rangeAnchor < 0) startRangeAt(i) else setRange(min(rangeAnchor, i), max(rangeAnchor, i))
+        selectFrame(i)
+    }
+
+    fun clearRange() {
+        rangeStart = -1
+        rangeEnd = -1
+        rangeAnchor = -1
+    }
+
+    private fun setRange(a: Int, b: Int) {
+        rangeStart = a
+        rangeEnd = b
+    }
+
+    /** (first index, count) of the selected range, or of the current frame. */
+    private fun target(): Pair<Int, Int> = if (hasRange) rangeStart to rangeCount else frameIndex to 1
+
+    /** Copies (or cuts) the range / current frame to the frame clipboard. */
+    fun copyFrames(cut: Boolean = false) {
+        val e = engine ?: return
+        if (isBusy) return
+        stopPlaying()
+        e.cancelStroke()
+        commitFloating()
+        val (from, count) = target()
+        val src = e.frameRange(from, count) ?: return
+        val clipboard = app.frameClipboard
+        runBulk(
+            BulkJob(
+                if (cut) "Cutting frames…" else "Copying frames…",
+                work = { progress -> clipboard.write(src, progress) },
+                done = {
+                    app.frameClipInfo = clipboard.info()
+                    if (cut) {
+                        if (e.deleteFrames(from, count)) clearRange() else toast("An animation needs at least one frame")
+                    }
+                    toast("${if (cut) "Cut" else "Copied"} $count frame${if (count == 1) "" else "s"}")
+                },
+            ),
+            inline = count * layerCount <= 32,
+        )
+    }
+
+    /** Pastes the frame clipboard before/after the range (or current frame), or at the end. */
+    fun pasteFrames(position: FramePosition) {
+        val e = engine ?: return
+        if (isBusy) return
+        val clip = app.frameClipboard.open() ?: run {
+            app.frameClipInfo = null
+            return
+        }
+        stopPlaying()
+        e.cancelStroke()
+        commitFloating()
+        val (from, count) = target()
+        val index = when (position) {
+            FramePosition.BEFORE -> from
+            FramePosition.AFTER -> from + count
+            FramePosition.END -> frameCount
+        }
+        clearRange()
+        runBulk(e.pasteFramesJob(clip, index), inline = clip.holds.size * clip.layerNames.size <= 32)
+    }
+
+    fun duplicateFrames(toEnd: Boolean) {
+        val e = engine ?: return
+        if (isBusy) return
+        stopPlaying()
+        commitFloating()
+        val (from, count) = target()
+        runBulk(e.duplicateFramesJob(from, count, toEnd), inline = count * layerCount <= 32)
+    }
+
+    fun reverseFrames() {
+        val (from, count) = target()
+        frameOp { it.reverseFrames(from, count) }
+    }
+
+    fun deleteFrames() {
+        val (from, count) = target()
+        frameOp {
+            if (!it.deleteFrames(from, count)) toast("An animation needs at least one frame")
+        }
+        clearRange()
+    }
+
+    /** Moves the range (or current frame) left/right by [delta] frames. */
+    fun moveFrames(delta: Int) {
+        val (from, count) = target()
+        var newStart = from
+        frameOp { newStart = it.moveFrames(from, count, delta) }
+        if (hasRange) setRange(newStart, newStart + count - 1)
+        if (rangeAnchor >= 0) rangeAnchor += newStart - from
+    }
+
+    fun setHolds(hold: Int) {
+        val (from, count) = target()
+        frameOp { it.setHolds(from, count, hold) }
+    }
 
     private inline fun frameOp(op: (EditorEngine) -> Unit) {
         val e = engine ?: return
+        if (isBusy) return
         stopPlaying()
         e.cancelStroke()
         commitFloating()
@@ -194,10 +481,13 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
 
     fun changeFps(value: Int) {
         val p = project ?: return
-        p.fps = value.coerceIn(1, 30)
+        p.fps = value.coerceIn(MIN_FPS, MAX_FPS)
         fps = p.fps
         changed()
-        if (isPlaying) { stopPlaying(); startPlaying() }
+        if (isPlaying) {
+            stopPlaying()
+            startPlaying()
+        }
     }
 
     fun toggleOnionSkin() {
@@ -207,27 +497,49 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
 
     private fun syncFrames() {
         val p = project ?: return
-        frameIndex = p.currentFrame
+        frameIndex = p.currentFrameIndex
         frameCount = p.frames.size
+        if (hasRange && rangeEnd >= frameCount) clearRange()
     }
 
     private fun updateOnion() {
         val p = project
-        if (p == null || !onionSkin || p.frames.size < 2) {
-            onionPrev = null; onionNext = null
+        val st = store
+        if (p == null || st == null || !onionSkin || p.frames.size < 2) {
+            onionPrev = null
+            onionNext = null
         } else {
-            val f = p.currentFrame
-            onionPrev = if (f > 0) bitmapOf(ColorMath.compositeFrame(p, f - 1)) else null
-            onionNext = if (f < p.frames.lastIndex) bitmapOf(ColorMath.compositeFrame(p, f + 1)) else null
+            val f = p.currentFrameIndex
+            onionPrev = if (f > 0) bitmapOf(ColorMath.compositeFrame(p, st, p.frames[f - 1].uid)) else null
+            onionNext = if (f < p.frames.lastIndex) bitmapOf(ColorMath.compositeFrame(p, st, p.frames[f + 1].uid)) else null
         }
         renderTick++
     }
 
-    /** Composite image of any frame (for the timeline thumbnails). */
-    fun frameImage(i: Int): ImageBitmap? {
+    /**
+     * Small thumbnail of a frame for the timeline (rendered off the main thread, cached until
+     * that frame's pixels or the layer setup change).
+     */
+    suspend fun frameThumb(frameUid: Long): ImageBitmap? {
         val p = project ?: return null
-        if (i !in p.frames.indices) return null
-        return bitmapOf(ColorMath.compositeFrame(p, i))
+        val st = store ?: return null
+        val key = "$frameUid:${st.frameVersion(frameUid)}:${p.layersVersion}"
+        thumbCache.get(key)?.let { return it }
+        val layerIds = p.visibleLayerIds()
+        val w = width
+        val h = height
+        val img = withContext(Dispatchers.Default) {
+            thumbBitmap(ColorMath.compositeFrame(layerIds, st, frameUid), w, h)
+        }
+        thumbCache.put(key, img)
+        return img
+    }
+
+    /** Current-frame pixels of one layer (for the layers list). */
+    fun layerThumb(layerId: Long): ImageBitmap? {
+        val p = project ?: return null
+        val px = store?.read(layerId, p.currentFrameUid) ?: return null
+        return bitmapOf(px)
     }
 
     private fun bitmapOf(px: IntArray): ImageBitmap =
@@ -237,19 +549,78 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
         if (isPlaying) stopPlaying() else startPlaying()
     }
 
-    private fun startPlaying() {
-        val p = project ?: return
-        if (p.frames.size < 2) return
-        engine?.cancelStroke()
+    private var player: PreviewPlayer? = null
+    private var playSources: AudioSources? = null
+
+    /**
+     * Plays the animation with its sound. The frame shown follows what is being heard.
+     * [fromMs] starts at that time without looping (voice-over recording); otherwise playback
+     * starts at the current frame and loops over the whole piece.
+     */
+    /**
+     * Plays from the current frame (looping), or once from [fromMs] (voice-over). [preRoll] is the
+     * recording count-in, played before the start.
+     */
+    private fun startPlaying(fromMs: Long? = null, preRoll: ShortArray? = null) {
+        val e = engine ?: return
+        val st = store ?: return
+        val p = e.project
+        val hasSound = p.audioEndMs() > 0
+        if (isBusy || (p.frames.size < 2 && !hasSound && fromMs == null)) return
+        e.cancelStroke()
         commitFloating()
-        playImages = p.frames.indices.map { bitmapOf(ColorMath.compositeFrame(p, it)) }
+        // Snapshot what playback needs, so it never touches the live frame list.
+        val uids = p.frameUids()
+        val timing = p.timing
+        val fpsNow = p.fps
+        val layerIds = p.visibleLayerIds()
+        val animTicks = timing.totalTicks
+        val totalMs = p.totalMs()
+        val startMs = fromMs ?: (timing.startTick(p.currentFrameIndex) * 1000L / fpsNow)
+        val sources = AudioSources(app.projects.audioDir(projectId))
+        val mixer = AudioMixer(p.tracks, p.clips) { sources.get(it) }
+        val pl = try {
+            PreviewPlayer(mixer, startMs * FRAMES_PER_MS, totalMs * FRAMES_PER_MS, loop = fromMs == null, preRoll = preRoll)
+                .also { it.start() }
+        } catch (t: Exception) {
+            sources.close()
+            toast("Can't play sound: ${t.message}")
+            return
+        }
+        player = pl
+        playSources = sources
+        val clock: PlaybackClock = AudioPlaybackClock(pl, fpsNow)
+        playTick = startMs * fpsNow / 1000
         isPlaying = true
         playJob = viewModelScope.launch {
-            var i = p.currentFrame
-            while (true) {
-                playIndex = i
-                delay(p.frames[i].hold * 1000L / p.fps)
-                i = (i + 1) % p.frames.size
+            suspend fun render(i: Int): ImageBitmap = withContext(Dispatchers.Default) {
+                bitmapOf(ColorMath.compositeFrame(layerIds, st, uids[i]))
+            }
+            // Frames rendered ahead of time (all access happens on the main thread).
+            val ahead = HashMap<Int, ImageBitmap>()
+            var shown = -1
+            while (isActive) {
+                // The playhead follows the sound; the animation repeats under longer sound
+                // ("loop until the sound ends").
+                val now = clock.nowTicks()
+                playTick = now
+                val tick = now % animTicks
+                val fi = timing.frameAtTick(tick)
+                if (fi != shown) {
+                    val img = ahead.remove(fi) ?: render(fi)
+                    playImage = img
+                    playIndex = fi
+                    shown = fi
+                    renderTick++
+                    // Prepare the next two frames while this one is on screen.
+                    val next = listOf((fi + 1) % uids.size, (fi + 2) % uids.size)
+                    ahead.keys.retainAll(next.toSet())
+                    for (n in next) {
+                        if (n !in ahead && n != fi) launch { ahead[n] = render(n) }
+                    }
+                }
+                val ticksLeft = timing.endTick(fi) - tick
+                delay((ticksLeft * 1000L / fpsNow).coerceIn(1L, 30L))
             }
         }
     }
@@ -257,23 +628,30 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
     fun stopPlaying() {
         playJob?.cancel()
         playJob = null
+        player?.stop()
+        player = null
+        playSources?.close()
+        playSources = null
         if (isPlaying) {
             isPlaying = false
-            playImages = emptyList()
+            playImage = null
             renderTick++
         }
     }
 
-    /** Every frame flattened (visible layers), in order. */
-    fun exportFrames(): List<IntArray> {
-        val p = project ?: return emptyList()
-        return p.frames.indices.map { ColorMath.compositeFrame(p, it) }
+    /** All frames flattened (visible layers), rendered on demand (call render off the main thread). */
+    fun exportFrameSource(): FrameSource {
+        val p = project ?: return FrameSource(0) { IntArray(0) }
+        val st = store ?: return FrameSource(0) { IntArray(0) }
+        val uids = p.frameUids()
+        val layerIds = p.visibleLayerIds()
+        return FrameSource(uids.size) { i -> ColorMath.compositeFrame(layerIds, st, uids[i]) }
     }
 
-    /** GIF delay per frame in 1/100 s. */
-    fun frameDelaysCs(): List<Int> {
-        val p = project ?: return emptyList()
-        return p.frames.map { (it.hold * 100.0 / p.fps).roundToInt() }
+    /** GIF delay per frame in 1/100 s (rounding error carried forward). */
+    fun frameDelaysCs(): IntArray {
+        val p = project ?: return IntArray(0)
+        return GifEncoder.delaysCs(IntArray(p.frames.size) { p.frames[it].hold }, p.fps)
     }
 
     fun toggleMirrorX() {
@@ -299,10 +677,20 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
 
     fun onPress(x: Int, y: Int) {
         val e = engine ?: return
-        // Touching the canvas while playing just stops playback.
-        ignoreGesture = isPlaying
-        if (isPlaying) { stopPlaying(); return }
-        pendingX = x; pendingY = y
+        // No drawing while recording (it would also stop a voice-over's playback).
+        if (recordState != RecordState.Idle) {
+            ignoreGesture = true
+            return
+        }
+        // Touching the canvas while playing just stops playback; nothing happens while busy.
+        ignoreGesture = isPlaying || isBusy
+        if (isPlaying) {
+            stopPlaying()
+            return
+        }
+        if (ignoreGesture) return
+        pendingX = x
+        pendingY = y
         when (tool) {
             Tool.Pencil -> e.beginStroke(x, y, color)
             Tool.Eraser -> e.beginStroke(x, y, 0)
@@ -311,12 +699,15 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
                 val f = e.floating
                 if (f != null) {
                     // Drag the floating cells from wherever the finger lands.
-                    grabDX = x - f.x; grabDY = y - f.y
-                    floatStartX = f.x; floatStartY = f.y
+                    grabDX = x - f.x
+                    grabDY = y - f.y
+                    floatStartX = f.x
+                    floatStartY = f.y
                 } else {
                     selSnapshot = e.selection?.copyOf()
                     if (selectMode == SelectMode.Rect) {
-                        rectStartX = x; rectStartY = y
+                        rectStartX = x
+                        rectStartY = y
                         e.selectRect(x, y, x, y)
                     } else {
                         e.beginSelectPaint(x, y)
@@ -331,7 +722,8 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
     fun onMove(x: Int, y: Int) {
         val e = engine ?: return
         if (ignoreGesture) return
-        pendingX = x; pendingY = y
+        pendingX = x
+        pendingY = y
         if (tool == Tool.Select) {
             if (e.floating != null) {
                 e.moveFloatingTo(x - grabDX, y - grabDY)
@@ -351,7 +743,10 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
 
     fun onRelease() {
         val e = engine ?: return
-        if (ignoreGesture) { ignoreGesture = false; return }
+        if (ignoreGesture) {
+            ignoreGesture = false
+            return
+        }
         val changed = when (tool) {
             Tool.Pencil, Tool.Eraser -> e.endStroke()
             Tool.Fill -> e.fill(pendingX, pendingY, color)
@@ -371,7 +766,10 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
     /** A second finger touched down: undo whatever the first finger started. */
     fun onCancel() {
         val e = engine ?: return
-        if (ignoreGesture) { ignoreGesture = false; return }
+        if (ignoreGesture) {
+            ignoreGesture = false
+            return
+        }
         if (tool == Tool.Select) {
             if (e.floating != null) {
                 e.moveFloatingTo(floatStartX, floatStartY)
@@ -388,8 +786,15 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
 
     // ---- Selection commands ------------------------------------------------------------
 
-    fun selectAll() { engine?.selectAll(); selectionChanged() }
-    fun deselect() { engine?.clearSelection(); selectionChanged() }
+    fun selectAll() {
+        engine?.selectAll()
+        selectionChanged()
+    }
+
+    fun deselect() {
+        engine?.clearSelection()
+        selectionChanged()
+    }
 
     fun copySelection() {
         val clip = engine?.copySelection() ?: return
@@ -471,32 +876,80 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
     // ---- Commands ------------------------------------------------------------------------
 
     fun undo() {
+        if (isBusy) return
         stopPlaying()
         // While cells are floating, undo means "put them back".
-        if (engine?.floating != null) { cancelFloating(); return }
+        if (engine?.floating != null) {
+            cancelFloating()
+            return
+        }
         if (engine?.undo() == true) changed(structure = true)
     }
 
     fun redo() {
+        if (isBusy) return
         stopPlaying()
         if (engine?.floating != null) return
         if (engine?.redo() == true) changed(structure = true)
     }
 
-    fun selectLayer(i: Int) { commitFloating(); engine?.selectLayer(i); structureTick++ }
+    fun selectLayer(i: Int) {
+        if (isBusy) return
+        commitFloating()
+        engine?.selectLayer(i)
+        structureTick++
+    }
+
     fun addLayer() = layerOp { it.addLayer() }
-    fun duplicateLayer() = layerOp { it.duplicateLayer() }
+    fun duplicateLayer() = runBulk(engine?.let { commitFloating(); it.duplicateLayerJob() })
     fun deleteLayer() = layerOp { it.deleteLayer() }
-    fun mergeDown() = layerOp { it.mergeDown() }
+    fun mergeDown() = runBulk(engine?.let { commitFloating(); it.mergeDownJob() })
     fun moveLayer(from: Int, to: Int) = layerOp { it.moveLayer(from, to) }
     fun setLayerVisible(i: Int, v: Boolean) = layerOp { it.setLayerVisible(i, v) }
     fun renameLayer(i: Int, name: String) = layerOp { it.renameLayer(i, name) }
 
+    val canAddLayer: Boolean get() = engine?.canAddLayer == true
+
     private inline fun layerOp(op: (EditorEngine) -> Unit) {
         val e = engine ?: return
+        if (isBusy) return
+        stopPlaying()
         commitFloating()
         op(e)
         changed(structure = true)
+    }
+
+    /**
+     * Runs a whole-animation job (merge, duplicate layer…) off the main thread with a progress
+     * overlay. Editing and saving pause until it finishes.
+     */
+    private fun runBulk(job: BulkJob?, inline: Boolean = false) {
+        if (job == null || isBusy) return
+        stopPlaying()
+        if (inline) {
+            // Small enough to do right away without an overlay.
+            try {
+                job.runWork {}
+                job.finish()
+                changed(structure = true)
+            } catch (e: Exception) {
+                toast("Something went wrong: ${e.message}")
+            }
+            return
+        }
+        busyLabel = job.label
+        busyProgress = 0f
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { job.runWork { busyProgress = it } }
+                job.finish()
+                busyLabel = null
+                changed(structure = true)
+            } catch (e: Exception) {
+                busyLabel = null
+                toast("Something went wrong: ${e.message}")
+            }
+        }
     }
 
     fun renameProject(name: String) {
@@ -512,29 +965,28 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
         if (tool == Tool.Eraser || tool == Tool.Eyedropper) tool = Tool.Pencil
     }
 
-    /** Flattened visible layers, for export. */
+    /** Flattened visible layers of the current frame, for export. */
     fun exportPixels(): IntArray = engine?.composite?.copyOf() ?: IntArray(width * height)
 
-    val layerCount: Int get() = engine?.project?.layers?.size ?: 0
-    val hiddenLayerCount: Int get() = engine?.project?.layers?.count { !it.visible } ?: 0
+    val layerCount: Int get() = project?.layers?.size ?: 0
+    val hiddenLayerCount: Int get() = project?.layers?.count { !it.visible } ?: 0
 
-    /** Copies of each layer (bottom to top) with export file names, for per-layer export. */
+    /** Each layer of the current frame (bottom to top) with export file names. */
     fun exportLayers(scale: Int, includeHidden: Boolean): List<ExportImage> {
-        val layers = engine?.project?.layers?.filter { includeHidden || it.visible } ?: return emptyList()
+        val p = project ?: return emptyList()
+        val st = store ?: return emptyList()
+        val layers = p.layers.filter { includeHidden || it.visible }
         val names = PngExporter.layerFileNames(layers.map { it.name }, scale)
-        return layers.mapIndexed { i, l -> ExportImage(names[i], l.pixels.copyOf()) }
+        return layers.mapIndexed { i, l ->
+            ExportImage(names[i], st.read(l.id, p.currentFrameUid)?.copyOf() ?: IntArray(p.size))
+        }
     }
 
     private var autosaveJob: Job? = null
 
     private fun changed(structure: Boolean = false) {
         unsaved = true
-        // Autosave a couple of seconds after the last edit, so a crash or forced close loses little.
-        autosaveJob?.cancel()
-        autosaveJob = viewModelScope.launch {
-            delay(2000)
-            if (engine?.isStroking != true) save()
-        }
+        scheduleAutosave()
         canUndo = engine?.history?.canUndo == true
         canRedo = engine?.history?.canRedo == true
         syncBitmap()
@@ -545,38 +997,409 @@ class EditorViewModel(private val app: PixelGoApp, projectId: String) : ViewMode
         }
     }
 
+    /** Autosave a couple of seconds after the last edit, so a crash or forced close loses little. */
+    private fun scheduleAutosave() {
+        autosaveJob?.cancel()
+        autosaveJob = viewModelScope.launch {
+            delay(2000)
+            if (engine?.isStroking == true || isBusy) scheduleAutosave() else save()
+        }
+    }
+
     private fun syncBitmap() {
         val e = engine ?: return
         var any = false
         e.consumeDirty(
-            onFull = { bitmap.setPixels(it, 0, width, 0, 0, width, height); any = true },
-            onPixel = { i, c -> bitmap.setPixel(i % width, i / width, c); any = true },
+            onFull = {
+                bitmap.setPixels(it, 0, width, 0, 0, width, height)
+                any = true
+            },
+            onPixel = { i, c ->
+                bitmap.setPixel(i % width, i / width, c)
+                any = true
+            },
         )
         if (any) renderTick++
     }
 
+    /**
+     * Captures everything that changed (on this thread, where edits happen) and hands it to
+     * the repository's IO thread. Only changed cels are written.
+     */
     fun save() {
-        val p = project ?: return
+        val e = engine ?: return
+        val st = store ?: return
         if (!unsaved) return
+        if (isBusy) {
+            scheduleAutosave()
+            return
+        }
         unsaved = false
+        val p = e.project
+        val dirty = st.snapshotDirty().toMutableList()
         // If cells are mid-move, save them where they came from (as if the move was cancelled)
         // without disturbing what's on screen.
-        val f = engine?.floating
+        val f = e.floating
         val lifted = f?.lifted
         if (f != null && lifted != null) {
-            val copy = p.deepCopy()
-            copy.layers.getOrNull(copy.indexOfLayer(f.layerId))?.let { l ->
-                lifted.forEach { (i, v) -> l.pixels[i] = v }
+            val key = CelKey(f.layerId, f.frameUid)
+            val at = dirty.indexOfFirst { it.key == key }
+            if (at >= 0) {
+                val base = dirty[at].pixels?.copyOf() ?: IntArray(p.size)
+                lifted.forEach { (i, v) -> base[i] = v }
+                dirty[at] = DirtyCel(key, if (CelStore.isEmpty(base)) null else base, dirty[at].version)
             }
-            app.projects.saveAsync(copy)
-        } else {
-            app.projects.saveAsync(p)
         }
+        val keepLayers = HashSet<Long>()
+        val keepFrames = HashSet<Long>()
+        e.collectRefs(keepLayers, keepFrames)
+        // Sounds: keep what clips (or undo history) use; forget the rest.
+        val keepAssets = HashSet<Long>()
+        e.collectAssetRefs(keepAssets)
+        if (recordingAssetId >= 0) keepAssets += recordingAssetId // file still being written
+        p.assets.removeAll { it.id !in keepAssets && it.id != recordingAssetId }
+        app.projects.save(
+            SaveSnapshot(
+                projectId = projectId,
+                meta = MetaSerializer.toBytes(p, System.currentTimeMillis()),
+                store = st,
+                dirty = dirty,
+                keepLayers = keepLayers,
+                keepFrames = keepFrames,
+                layerBound = p.nextLayerId,
+                frameBound = p.nextFrameUid,
+                thumbLayerIds = p.visibleLayerIds(),
+                thumbFrameUid = p.frames.first().uid,
+                width = p.width,
+                height = p.height,
+                keepAssets = keepAssets,
+                assetBound = p.nextAssetId,
+            )
+        )
     }
 
     override fun onCleared() {
+        stopRecording(keep = true)
         stopPlaying()
         engine?.cancelStroke()
         save()
+    }
+
+    /** The app went to the background: stop sound and recording (the mic stops working anyway). */
+    fun onBackgrounded() {
+        if (recordState != RecordState.Idle) stopRecording(keep = true)
+        stopPlaying()
+        save()
+    }
+
+    // ---- Audio ---------------------------------------------------------------------------
+
+    /** Track that imports / recordings go to (null = make a new one). */
+    var selectedTrackId by mutableStateOf<Long?>(null)
+
+    /** Clip whose options sheet is open. */
+    var selectedClipId by mutableStateOf<Long?>(null)
+
+    /** Waveform peaks per asset (loaded lazily). */
+    private val peaksCache = androidx.compose.runtime.mutableStateMapOf<Long, ByteArray>()
+    private val peaksLoading = HashSet<Long>()
+
+    var recordState by mutableStateOf(RecordState.Idle)
+        private set
+    var countIn by mutableIntStateOf(0)
+        private set
+    var recordLevel by mutableFloatStateOf(0f)
+        private set
+    var recordElapsedMs by mutableLongStateOf(0L)
+        private set
+
+    private var recorder: AudioRecorder? = null
+    private var recordJob: Job? = null
+    private var recordingAssetId = -1L
+    private var recordTrack: Long? = null
+    private var recordStartMs = 0L
+
+    /** What the recording is lined up with: the voice-over playback, or the count-in on its own. */
+    private var recordRef: PreviewPlayer? = null
+    private var countInPlayer: PreviewPlayer? = null
+
+    /**
+     * The track a new recording should go on: the selected track, unless it already has sound
+     * from the current frame on (then a new track, so the recording doesn't land on top of it).
+     */
+    fun defaultRecordTrack(): Long? {
+        val t = selectedTrackId ?: return null
+        val from = currentFrameMs()
+        return if (clips().any { it.trackId == t && it.endMs > from }) null else t
+    }
+
+    fun tracks() = project?.tracks.orEmpty()
+    fun clips() = project?.clips.orEmpty()
+    fun assetName(id: Long) = project?.asset(id)?.name ?: "Sound"
+    fun assetDurationMs(id: Long) = project?.asset(id)?.durationMs ?: 0L
+    val loopToAudio: Boolean get() = project?.loopToAudio == true
+    fun totalMs(): Long = project?.totalMs() ?: 0L
+    fun animationMs(): Long = project?.animationMs() ?: 0L
+
+    /** Timeline time (ms) where the current frame starts. */
+    fun currentFrameMs(): Long {
+        val p = project ?: return 0
+        return p.timing.startTick(p.currentFrameIndex) * 1000L / p.fps
+    }
+
+    private fun audioDir() = app.projects.audioDir(projectId)
+    private fun pcmFile(assetId: Long) = java.io.File(audioDir(), "$assetId.pcm")
+    private fun peaksFile(assetId: Long) = java.io.File(audioDir(), "$assetId.peaks")
+
+    /** Waveform peaks of an asset, or null while they load. */
+    fun peaks(assetId: Long): ByteArray? {
+        peaksCache[assetId]?.let { return it }
+        if (peaksLoading.add(assetId)) {
+            viewModelScope.launch {
+                val p = withContext(Dispatchers.IO) { Peaks.read(peaksFile(assetId)) }
+                peaksCache[assetId] = p
+                peaksLoading.remove(assetId)
+            }
+        }
+        return null
+    }
+
+    private fun freeSpaceMb(): Long = android.os.StatFs(app.filesDir.path).availableBytes / (1024 * 1024)
+
+    /** Decodes a sound file (picked by the user) into the project and places it at the current frame. */
+    fun importAudio(uri: android.net.Uri) {
+        val e = engine ?: return
+        if (isBusy) return
+        if (freeSpaceMb() < 100) {
+            toast("Not enough free space on the phone to import sound")
+            return
+        }
+        stopPlaying()
+        commitFloating()
+        val assetId = e.newAssetId()
+        val startMs = currentFrameMs()
+        val track = selectedTrackId
+        busyLabel = "Importing sound…"
+        busyProgress = 0f
+        viewModelScope.launch {
+            try {
+                val d = withContext(Dispatchers.IO) {
+                    AudioDecoder.decode(app, uri, pcmFile(assetId), peaksFile(assetId), { busyProgress = it }, { false })
+                }
+                busyLabel = null
+                e.addAsset(AudioAsset(assetId, d.name, d.durationMs, d.channels))
+                e.addClip(track, "Music", assetId, startMs)?.let { selectedTrackId = it.trackId }
+                changed(structure = true)
+                if (d.durationMs > animationMs() && !loopToAudio && frameCount <= 1) setLoopToAudio(true)
+            } catch (t: Throwable) {
+                busyLabel = null
+                toast("Couldn't import that sound: ${t.message ?: t.javaClass.simpleName}")
+            }
+        }
+    }
+
+    /**
+     * Records from the microphone. Voice-over plays the animation (with existing sound) from
+     * the current frame while recording; otherwise it just records, starting at the current
+     * frame. Needs the RECORD_AUDIO permission.
+     *
+     * The microphone starts first, so it also hears the count-in ticks; [stopRecording] uses them
+     * to line the recording up exactly (see [CountIn]).
+     */
+    fun startRecording(voiceOver: Boolean, withCountIn: Boolean, trackId: Long?) {
+        val e = engine ?: return
+        if (isBusy || recordState != RecordState.Idle) return
+        if (freeSpaceMb() < 50) {
+            toast("Not enough free space on the phone to record")
+            return
+        }
+        stopPlaying()
+        e.cancelStroke()
+        commitFloating()
+        recordTrack = trackId
+        recordStartMs = currentFrameMs()
+        recordingAssetId = e.newAssetId()
+        recordElapsedMs = 0
+        recordJob = viewModelScope.launch {
+            val rec = AudioRecorder(pcmFile(recordingAssetId), peaksFile(recordingAssetId))
+            try {
+                withContext(Dispatchers.IO) { rec.start() }
+            } catch (t: Throwable) {
+                recordState = RecordState.Idle
+                toast(t.message ?: "Couldn't start recording")
+                return@launch
+            }
+            recorder = rec
+            val preRoll = if (withCountIn) CountIn.sound() else null
+            val ref: PreviewPlayer? = when {
+                voiceOver -> {
+                    startPlaying(fromMs = recordStartMs, preRoll = preRoll)
+                    player
+                }
+                preRoll != null -> try {
+                    PreviewPlayer(AudioMixer(emptyList(), emptyList()) { null }, 0, 0, loop = false, preRoll = preRoll)
+                        .also { it.start(); countInPlayer = it }
+                } catch (_: Exception) {
+                    null
+                }
+                else -> null
+            }
+            recordRef = ref
+            val countInFrames = ref?.preRollFrames ?: 0L
+            recordState = if (countInFrames > 0) RecordState.CountIn else RecordState.Recording
+            countIn = 3
+            var t0 = System.nanoTime()
+            while (isActive) {
+                if (recordState == RecordState.CountIn) {
+                    // Follow what is heard: 3, 2, 1 with the ticks, recording from the 4th beat.
+                    val heard = ref?.heardFrames() ?: countInFrames
+                    if (heard >= countInFrames) {
+                        recordState = RecordState.Recording
+                        t0 = System.nanoTime()
+                    } else {
+                        countIn = when {
+                            heard < CountIn.TICK_MS[1] * FRAMES_PER_MS -> 3
+                            heard < CountIn.TICK_MS[2] * FRAMES_PER_MS -> 2
+                            else -> 1
+                        }
+                    }
+                } else {
+                    recordElapsedMs = (System.nanoTime() - t0) / 1_000_000
+                }
+                recordLevel = rec.level
+                delay(50)
+            }
+        }
+    }
+
+    /** Stops recording; with [keep], the recording becomes a clip (one undo step). */
+    fun stopRecording(keep: Boolean = true) {
+        val e = engine
+        recordJob?.cancel()
+        recordJob = null
+        val rec = recorder
+        recorder = null
+        val ref = recordRef
+        recordRef = null
+        // Read what lining up needs before the players are released.
+        val refFirstNanos = ref?.firstFrameNanos()
+        val countInFrames = ref?.preRollFrames ?: 0L
+        val outType = ref?.outputDeviceType() ?: 0
+        stopPlaying()
+        countInPlayer?.stop()
+        countInPlayer = null
+        if (rec == null || e == null) {
+            recordState = RecordState.Idle
+            return
+        }
+        val durationMs = rec.stop()
+        recordState = RecordState.Idle
+        recordLevel = 0f
+        val assetId = recordingAssetId
+        recordingAssetId = -1L
+        // How far into the recording the start frame was heard; the count-in before it is cut off.
+        val startInRec = if (ref == null) 0.0 else lineUp(rec, assetId, refFirstNanos, countInFrames, "$outType-${rec.inputDeviceType}")
+        val inMs = startInRec.roundToLong().coerceAtLeast(0)
+        val startMs = recordStartMs + (-startInRec).roundToLong().coerceAtLeast(0)
+        if (!keep || durationMs - inMs < 150) {
+            pcmFile(assetId).delete()
+            peaksFile(assetId).delete()
+            if (keep) toast("Recording too short")
+            return
+        }
+        val name = Names.numbered("Recording", project?.assets.orEmpty().map { it.name })
+        e.addAsset(AudioAsset(assetId, name, durationMs, 1))
+        e.addClip(recordTrack, "Voice", assetId, startMs, inMs)?.let { selectedTrackId = it.trackId }
+        changed(structure = true)
+    }
+
+    /**
+     * How far into the recording (ms) the start frame was heard. Exact when the microphone heard
+     * the count-in ticks; otherwise the audio timestamps, corrected by what the count-in measured
+     * last time on the same speaker/microphone [route] (phones' timestamps can be ~0.1 s off).
+     */
+    private fun lineUp(rec: AudioRecorder, assetId: Long, refFirstNanos: Long?, countInFrames: Long, route: String): Double {
+        val countInMs = countInFrames.toDouble() / FRAMES_PER_MS
+        // When the first played sample was heard, in ms after the first recorded one.
+        val tsLead = if (refFirstNanos != null && rec.timestamped) (refFirstNanos - rec.firstFrameNanos) / 1e6 else null
+        if (countInFrames > 0) {
+            val heardAt = try { findCountIn(assetId, tsLead) } catch (_: Exception) { null }
+            if (heardAt != null && (tsLead == null || abs(heardAt - tsLead) < 400)) {
+                if (tsLead != null) app.settings.setRecordCorrectionMs(route, (tsLead - heardAt).toFloat())
+                return heardAt + countInMs
+            }
+        }
+        val correction = app.settings.recordCorrectionMs(route)
+        if (correction == null) toast("Couldn't measure the timing (count-in off, or headphones). Nudge the clip if it's off.")
+        val lead = if (tsLead != null) tsLead - (correction ?: 0f) else 0.0
+        return lead + countInMs
+    }
+
+    /** Where (ms into the recording) the count-in's first sample was heard, from its ticks. */
+    private fun findCountIn(assetId: Long, tsLead: Double?): Double? {
+        PcmFile(pcmFile(assetId)).use { p ->
+            // Look only until just after the last tick, before the voice-over playback can be heard.
+            val endMs = (tsLead ?: 300.0).coerceIn(-200.0, 1500.0) + CountIn.TICK_MS.last() + 600
+            val n = minOf(p.frames, (endMs * FRAMES_PER_MS).toLong()).toInt()
+            if (n <= 0) return null
+            val st = FloatArray(n * 2)
+            p.readStereo(0, n, st)
+            val mono = FloatArray(n) { st[2 * it] }
+            return CountIn.locate(mono, n)?.let { it / FRAMES_PER_MS }
+        }
+    }
+
+    // Clip / track edits (each is one undo step)
+
+    fun moveClipLive(c: com.pixelgo.model.AudioClip) {
+        engine?.setClipLive(c)
+        structureTick++
+    }
+
+    fun finishClipDrag(original: com.pixelgo.model.AudioClip) {
+        engine?.commitClip(original)
+        changed(structure = true)
+    }
+
+    fun changeClip(c: com.pixelgo.model.AudioClip) = audioOp { it.changeClip(c) }
+    fun deleteClip(id: Long) = audioOp { it.deleteClip(id); selectedClipId = null }
+    fun duplicateClip(id: Long) = audioOp { it.duplicateClip(id) }
+    fun splitClipAtCurrentFrame(id: Long) = audioOp {
+        if (!it.splitClip(id, currentFrameMs())) toast("Move to a frame inside the clip to split it")
+    }
+
+    fun addTrack() = audioOp { selectedTrackId = it.addTrack("Track ${tracks().size + 1}").id }
+    fun changeTrack(t: com.pixelgo.model.SoundTrack) = audioOp { it.changeTrack(t) }
+    fun deleteTrack(id: Long) = audioOp {
+        it.deleteTrack(id)
+        if (selectedTrackId == id) selectedTrackId = null
+    }
+
+    fun setLoopToAudio(value: Boolean) {
+        val p = project ?: return
+        if (p.loopToAudio == value) return
+        p.loopToAudio = value
+        changed(structure = true)
+    }
+
+    private inline fun audioOp(op: (EditorEngine) -> Unit) {
+        val e = engine ?: return
+        if (isBusy) return
+        stopPlaying()
+        op(e)
+        changed(structure = true)
+    }
+
+    companion object {
+        /** Nearest-neighbour downscale to at most 64 px on the long side (timeline thumbnails). */
+        fun thumbBitmap(px: IntArray, w: Int, h: Int): ImageBitmap {
+            val step = maxOf(1, (maxOf(w, h) + 63) / 64)
+            val tw = (w + step - 1) / step
+            val th = (h + step - 1) / step
+            val out = if (step == 1) px else IntArray(tw * th) { k ->
+                px[min(h - 1, (k / tw) * step) * w + min(w - 1, (k % tw) * step)]
+            }
+            return Bitmap.createBitmap(out, tw, th, Bitmap.Config.ARGB_8888).asImageBitmap()
+        }
     }
 }

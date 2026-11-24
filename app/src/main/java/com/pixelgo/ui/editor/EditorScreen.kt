@@ -28,7 +28,14 @@ import androidx.compose.material.icons.filled.HighlightAlt
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MoreVert
+import android.content.Intent
+import com.pixelgo.export.ExportJobs
+import com.pixelgo.export.ExportState
 import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -74,19 +81,28 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
         factory = viewModelFactory { initializer { EditorViewModel(app, projectId) } },
     )
 
-    if (vm.engine == null) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("This project could not be opened.")
-                Button(onClick = onBack, modifier = Modifier.padding(top = 12.dp)) { Text("Back") }
-            }
+    when (vm.loadState) {
+        LoadState.Loading -> {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+            return
         }
-        return
+        LoadState.Failed -> {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("This project could not be opened.")
+                    Button(onClick = onBack, modifier = Modifier.padding(top = 12.dp)) { Text("Back") }
+                }
+            }
+            return
+        }
+        LoadState.Ready -> Unit
     }
+    val engine = vm.engine ?: return
 
     val leave = { vm.save(); onBack() }
     BackHandler(onBack = leave)
-    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { vm.save() }
+    // Leaving the app: stop sound/recording (Android silences the mic in the background) and save.
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { vm.onBackgrounded() }
 
     var menu by remember { mutableStateOf(false) }
     var showLayers by remember { mutableStateOf(false) }
@@ -128,8 +144,8 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
         Column(Modifier.fillMaxSize().padding(padding)) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 PixelCanvas(vm)
-                val layer = vm.engine.project.activeLayer
                 vm.structureTick
+                val layer = engine.project.activeLayer
                 if (layer != null) {
                     Text(
                         "${layer.name}${if (!layer.visible) " (hidden)" else ""}" +
@@ -150,11 +166,38 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
                         SelectionBar(vm)
                         HorizontalDivider()
                     }
-                    Timeline(vm)
+                    TimelineView(vm)
                     HorizontalDivider()
                     PaletteStrip(vm, app.palettes, onEditCurrentColor = { showPicker = true }, onManagePalettes = onPalettes)
                     HorizontalDivider()
                     ToolBar(vm, onLayers = { showLayers = true })
+                }
+            }
+        }
+    }
+
+    // A video export of this project: progress while it runs, then the result.
+    val export = ExportJobs.state
+    if (export != null && export.projectId == projectId) {
+        ExportOverlay(export)
+    }
+
+    // Long jobs (merging, duplicating layers…) block editing with a progress overlay.
+    vm.busyLabel?.let { label ->
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color(0xAA000000))
+                .pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent().changes.forEach { it.consume() } } },
+            contentAlignment = Alignment.Center,
+        ) {
+            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+                Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(label, style = MaterialTheme.typography.titleMedium)
+                    LinearProgressIndicator(
+                        progress = { vm.busyProgress },
+                        modifier = Modifier.padding(top = 16.dp).fillMaxWidth(0.6f),
+                    )
                 }
             }
         }
@@ -174,6 +217,59 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
         TextInputDialog("Rename project", vm.projectName, onDismiss = { renaming = false }) {
             renaming = false
             vm.renameProject(it)
+        }
+    }
+}
+
+/** Blocks the editor while a video export runs, then shows where it was saved. */
+@Composable
+private fun ExportOverlay(s: ExportState) {
+    val context = LocalContext.current
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0xCC000000))
+            .pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent().changes.forEach { it.consume() } } },
+        contentAlignment = Alignment.Center,
+    ) {
+        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+            Column(Modifier.padding(24.dp).fillMaxWidth(0.85f), horizontalAlignment = Alignment.CenterHorizontally) {
+                when {
+                    !s.done -> {
+                        Text(s.title, style = MaterialTheme.typography.titleMedium)
+                        LinearProgressIndicator(progress = { s.progress }, modifier = Modifier.padding(top = 16.dp).fillMaxWidth())
+                        Text("${(s.progress * 100).toInt()}%", modifier = Modifier.padding(top = 8.dp))
+                        Text(
+                            "You can switch apps; the export keeps going.",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                        TextButton(onClick = { ExportJobs.cancel() }, modifier = Modifier.padding(top = 8.dp)) { Text("Cancel export") }
+                    }
+                    s.error != null -> {
+                        Text("Export didn't finish", style = MaterialTheme.typography.titleMedium)
+                        Text(s.error, modifier = Modifier.padding(top = 8.dp))
+                        TextButton(onClick = { ExportJobs.dismiss() }, modifier = Modifier.padding(top = 8.dp)) { Text("OK") }
+                    }
+                    else -> {
+                        Text("Video saved", style = MaterialTheme.typography.titleMedium)
+                        Text(s.resultPath ?: "", modifier = Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall)
+                        Row(Modifier.padding(top = 8.dp)) {
+                            s.resultUri?.let { uri ->
+                                TextButton(onClick = {
+                                    val send = Intent(Intent.ACTION_SEND).apply {
+                                        type = s.mime
+                                        putExtra(Intent.EXTRA_STREAM, uri)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(Intent.createChooser(send, "Share video"))
+                                }) { Text("Share") }
+                            }
+                            TextButton(onClick = { ExportJobs.dismiss() }) { Text("OK") }
+                        }
+                    }
+                }
+            }
         }
     }
 }

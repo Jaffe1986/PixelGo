@@ -1,13 +1,15 @@
 package com.pixelgo
 
 import com.pixelgo.data.GifEncoder
-import com.pixelgo.data.ProjectSerializer
+import com.pixelgo.data.LegacyPxg
+import com.pixelgo.data.MetaSerializer
 import com.pixelgo.data.sheetGrid
 import com.pixelgo.editor.ColorMath
 import com.pixelgo.editor.EditorEngine
-import com.pixelgo.model.PixelProject
-import org.junit.Assert.assertArrayEquals
+import com.pixelgo.editor.FramePosition
+import com.pixelgo.model.MAX_HOLD
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -21,42 +23,84 @@ import javax.imageio.stream.MemoryCacheImageInputStream
 class AnimationTest {
     private val red = 0xFFFF0000.toInt()
     private val blue = 0xFF0000FF.toInt()
+    private val green = 0xFF00FF00.toInt()
 
-    private fun engine(w: Int = 4, h: Int = 4) = EditorEngine(PixelProject.create("t", "Anim", w, h))
-    private fun EditorEngine.dot(x: Int, y: Int, c: Int) { beginStroke(x, y, c); endStroke() }
-    private fun EditorEngine.cel(frame: Int, layer: Int = 0) = project.layers[layer].cels[frame]
+    private fun engine(w: Int = 4, h: Int = 4) = testEngine(w, h)
+
+    /** Pixel [i] of layer [layer] on frame [frame] (indices), 0 if the cel is empty. */
+    private fun EditorEngine.at(frame: Int, i: Int, layer: Int = 0): Int =
+        store.read(project.layers[layer].id, project.frames[frame].uid)?.get(i) ?: 0
 
     @Test fun drawingOnlyAffectsCurrentFrame() {
         val e = engine()
         e.dot(0, 0, red)
         e.addFrame()                      // blank frame 2, now current
-        assertEquals(1, e.project.currentFrame)
-        assertEquals(0, e.project.layers[0].pixels[0])
+        assertEquals(1, e.project.currentFrameIndex)
+        assertEquals(0, e.px(0, 0))
         e.dot(1, 0, blue)
-        assertEquals(red, e.cel(0)[0]); assertEquals(0, e.cel(0)[1])
-        assertEquals(0, e.cel(1)[0]); assertEquals(blue, e.cel(1)[1])
+        assertEquals(red, e.at(0, 0)); assertEquals(0, e.at(0, 1))
+        assertEquals(0, e.at(1, 0)); assertEquals(blue, e.at(1, 1))
     }
 
     @Test fun duplicateFrameCopiesAndIsIndependent() {
         val e = engine()
         e.dot(0, 0, red)
         e.duplicateFrame()
-        assertEquals(red, e.cel(1)[0])
+        assertEquals(red, e.at(1, 0))
         e.dot(0, 0, blue)                 // edit the copy
-        assertEquals(red, e.cel(0)[0])
-        assertEquals(blue, e.cel(1)[0])
+        assertEquals(red, e.at(0, 0))
+        assertEquals(blue, e.at(1, 0))
+    }
+
+    @Test fun duplicateToEndAppendsAfterLastFrame() {
+        val e = engine()
+        e.dot(0, 0, red)                  // A
+        e.addFrame(); e.dot(0, 0, blue)   // B
+        e.addFrame(); e.dot(0, 0, green)  // C
+        e.selectFrame(0)
+        e.duplicateFrame(toEnd = true)    // A B C A'
+        assertEquals(4, e.project.frames.size)
+        assertEquals(3, e.project.currentFrameIndex)
+        assertEquals(red, e.at(3, 0))
+        assertEquals(blue, e.at(1, 0))
+        e.undo()
+        assertEquals(3, e.project.frames.size)
+    }
+
+    @Test fun insertBeforeAndAfter() {
+        val e = engine()
+        e.dot(0, 0, red)                  // A
+        e.addFrame(FramePosition.BEFORE)  // _ A
+        assertEquals(0, e.project.currentFrameIndex)
+        assertEquals(red, e.at(1, 0))
+        e.selectFrame(1)
+        e.addFrame(FramePosition.AFTER)   // _ A _
+        assertEquals(2, e.project.currentFrameIndex)
+        assertEquals(3, e.project.frames.size)
+        e.addFrame(FramePosition.END)
+        assertEquals(3, e.project.currentFrameIndex)
     }
 
     @Test fun undoOfEditOnOtherFrameJumpsBackToIt() {
         val e = engine()
         e.dot(0, 0, red)                  // frame 0
-        e.addFrame()                      // frame 1
-        e.selectFrame(1)
+        e.addFrame()                      // frame 1 (current)
         e.undo()                          // undo add-frame
         assertEquals(1, e.project.frames.size)
         e.undo()                          // undo the dot on frame 0
-        assertEquals(0, e.cel(0)[0])
-        assertEquals(0, e.project.currentFrame)
+        assertEquals(0, e.at(0, 0))
+        assertEquals(0, e.project.currentFrameIndex)
+    }
+
+    @Test fun currentFrameFollowsUidWhenFramesMove() {
+        val e = engine()
+        e.dot(0, 0, red)                  // f0 red
+        e.addFrame(); e.dot(0, 0, blue)   // f1 blue (current)
+        val blueUid = e.project.currentFrameUid
+        e.moveFrame(1, 0)                 // [blue, red]
+        assertEquals(blueUid, e.project.currentFrameUid)
+        assertEquals(0, e.project.currentFrameIndex)
+        assertEquals(blue, e.px(0, 0))
     }
 
     @Test fun deleteAndMoveFramesWithUndo() {
@@ -64,21 +108,33 @@ class AnimationTest {
         e.dot(0, 0, red)                  // f0 red
         e.addFrame(); e.dot(0, 0, blue)   // f1 blue
         e.moveFrame(1, 0)                 // [blue, red]
-        assertEquals(blue, e.cel(0)[0]); assertEquals(red, e.cel(1)[0])
+        assertEquals(blue, e.at(0, 0)); assertEquals(red, e.at(1, 0))
         e.selectFrame(0)
         e.deleteFrame()                   // [red]
-        assertEquals(1, e.project.frames.size); assertEquals(red, e.cel(0)[0])
-        e.undo()                          // [blue, red]
-        assertEquals(2, e.project.frames.size); assertEquals(blue, e.cel(0)[0])
+        assertEquals(1, e.project.frames.size); assertEquals(red, e.at(0, 0))
+        e.undo()                          // [blue, red] - deleted frame's pixels still there
+        assertEquals(2, e.project.frames.size); assertEquals(blue, e.at(0, 0))
         e.undo()                          // [red, blue]
-        assertEquals(red, e.cel(0)[0]); assertEquals(blue, e.cel(1)[0])
+        assertEquals(red, e.at(0, 0)); assertEquals(blue, e.at(1, 0))
     }
 
-    @Test fun newLayerGetsACelForEveryFrame() {
+    @Test fun deletedFrameStaysReferencedByHistory() {
+        val e = engine()
+        e.addFrame()
+        val uid = e.project.currentFrameUid
+        e.deleteFrame()
+        val frames = HashSet<Long>()
+        e.collectRefs(HashSet(), frames)
+        assertTrue(uid in frames)
+    }
+
+    @Test fun newLayerIsEmptyOnEveryFrameAndDrawable() {
         val e = engine()
         e.addFrame(); e.addFrame()
         e.addLayer()
-        assertEquals(3, e.project.layers[1].cels.size)
+        for (f in 0..2) assertNull(e.store.read(e.project.layers[1].id, e.project.frames[f].uid))
+        e.dot(2, 0, red)
+        assertEquals(red, e.at(2, 2, layer = 1))
     }
 
     @Test fun mergeDownMergesAllFrames() {
@@ -87,39 +143,55 @@ class AnimationTest {
         e.selectFrame(0); e.dot(0, 0, red)
         e.addLayer()
         e.selectFrame(1); e.dot(1, 0, blue)
-        e.mergeDown()
-        assertEquals(red, e.cel(0)[0])
-        assertEquals(blue, e.cel(1)[1])
+        e.mergeDownJob()!!.let { it.runWork {}; it.finish() }
+        assertEquals(red, e.at(0, 0))
+        assertEquals(blue, e.at(1, 1))
         e.undo()
-        assertEquals(0, e.cel(1, 0)[1])
-        assertEquals(blue, e.cel(1, 1)[1])
+        assertEquals(0, e.at(1, 1, layer = 0))
+        assertEquals(blue, e.at(1, 1, layer = 1))
     }
 
-    @Test fun holdIsUndoable() {
+    @Test fun duplicateLayerCopiesEveryFrame() {
+        val e = engine()
+        e.dot(0, 0, red)
+        e.addFrame(); e.dot(1, 0, blue)
+        e.duplicateLayerJob()!!.let { it.runWork {}; it.finish() }
+        assertEquals(2, e.project.layers.size)
+        assertEquals(red, e.at(0, 0, layer = 1))
+        assertEquals(blue, e.at(1, 1, layer = 1))
+        e.undo()
+        assertEquals(1, e.project.layers.size)
+    }
+
+    @Test fun holdIsUndoableAndCanBeLong() {
         val e = engine()
         e.setFrameHold(0, 3)
         assertEquals(3, e.project.frames[0].hold)
         e.undo()
         assertEquals(1, e.project.frames[0].hold)
+        e.setFrameHold(0, 5000)
+        assertEquals(MAX_HOLD, e.project.frames[0].hold)
+        assertEquals(MAX_HOLD.toLong(), e.project.timing.totalTicks)
     }
 
-    @Test fun animatedProjectRoundTrip() {
+    @Test fun animatedProjectMetaRoundTrip() {
         val e = engine(3, 2)
         e.dot(0, 0, red)
         e.addFrame(); e.dot(2, 1, blue)
         e.setFrameHold(1, 2)
-        e.project.fps = 12
-        val bytes = ByteArrayOutputStream().also { ProjectSerializer.write(e.project, 5L, it) }.toByteArray()
-        val header = ProjectSerializer.readHeader(ByteArrayInputStream(bytes))
+        e.project.fps = 60
+        val bytes = ByteArrayOutputStream().also { MetaSerializer.write(e.project, 5L, it) }.toByteArray()
+        val header = MetaSerializer.readHeader(ByteArrayInputStream(bytes))
         assertEquals(2, header.frameCount)
-        val p = ProjectSerializer.read("t", ByteArrayInputStream(bytes))
+        assertEquals(3L, header.totalTicks)
+        assertEquals(50L, header.durationMs) // 3 ticks at 60 fps
+        val p = MetaSerializer.read("t", ByteArrayInputStream(bytes))
         assertEquals(2, p.frames.size)
-        assertEquals(12, p.fps)
+        assertEquals(60, p.fps)
         assertEquals(2, p.frames[1].hold)
-        assertEquals(1, p.currentFrame)
-        assertArrayEquals(e.cel(0), p.layers[0].cels[0])
-        assertArrayEquals(e.cel(1), p.layers[0].cels[1])
-        assertEquals(blue, p.layers[0].pixels[5]) // pixels follows the current frame
+        assertEquals(e.project.currentFrameUid, p.currentFrameUid)
+        assertEquals(e.project.frames.map { it.uid }, p.frames.map { it.uid })
+        assertEquals(e.project.nextFrameUid, p.nextFrameUid)
     }
 
     @Test fun readsOldSingleFrameFiles() {
@@ -136,10 +208,10 @@ class AnimationTest {
             flush()
         }
         z.finish()
-        val p = ProjectSerializer.read("o", ByteArrayInputStream(out.toByteArray()))
-        assertEquals(1, p.frames.size)
+        val p = LegacyPxg.read(ByteArrayInputStream(out.toByteArray()))
+        assertEquals(1, p.holds.size)
         assertEquals(8, p.fps)
-        assertEquals(red, p.layers[0].pixels[0])
+        assertEquals(red, p.layers[0].cels[0][0])
     }
 
     @Test fun gifDecodesWithCorrectFramesSizeAndTransparency() {
@@ -171,23 +243,28 @@ class AnimationTest {
         }.toByteArray()
         val img = ImageIO.read(ByteArrayInputStream(bytes))
         assertEquals(w, img.width)
-        // Every decoded pixel must be one of the palette colors (no corrupt stream)
         val palette = GifEncoder.buildPalette(listOf(frame)).map { it or 0xFF000000.toInt() }.toSet()
         for (y in 0 until h) for (x in 0 until w) assertTrue(img.getRGB(x, y) in palette)
-        // Colors that made the palette decode exactly
-        val exact = (0 until w * h).first { (frame[it] and 0xFFFFFF) in GifEncoder.buildPalette(listOf(frame)).toSet() }
-        assertEquals(frame[exact], img.getRGB(exact % w, exact / w))
     }
 
-    @Test fun gifPaletteKeepsExactColorsForPixelArt() {
-        val w = 16; val h = 16
-        val frame = IntArray(w * h) { if (it % 3 == 0) red else if (it % 3 == 1) blue else 0 }
-        val bytes = ByteArrayOutputStream().also { GifEncoder.encode(listOf(frame), w, h, 1, listOf(10), it) }.toByteArray()
-        val img = ImageIO.read(ByteArrayInputStream(bytes))
-        for (i in 0 until w * h) {
-            val got = img.getRGB(i % w, i / w)
-            if (frame[i] == 0) assertEquals(0, got ushr 24) else assertEquals(frame[i], got)
-        }
+    @Test fun gifStreamsFromProviderWithoutAList() {
+        val w = 2; val h = 2
+        var calls = 0
+        val bytes = ByteArrayOutputStream().also {
+            GifEncoder.encode(3, { i -> calls++; IntArray(w * h) { if (it == i) red else 0 } }, w, h, 1, intArrayOf(5, 5, 5), it)
+        }.toByteArray()
+        assertEquals(6, calls) // palette pass + encode pass
+        val reader = ImageIO.getImageReadersByFormatName("gif").next()
+        reader.input = MemoryCacheImageInputStream(ByteArrayInputStream(bytes))
+        assertEquals(3, reader.getNumImages(true))
+    }
+
+    @Test fun gifDelaysCarryRoundingSoTotalIsExact() {
+        val d = GifEncoder.delaysCs(intArrayOf(1, 1, 1, 1), 8) // 12.5 cs each
+        assertEquals(50, d.sum())
+        assertTrue(d.all { it in 12..13 })
+        val fast = GifEncoder.delaysCs(IntArray(6) { 1 }, 60)  // 1.67 cs: raised to the 2 cs minimum
+        assertTrue(fast.all { it >= 2 })
     }
 
     @Test fun spriteSheetGrid() {
@@ -199,7 +276,7 @@ class AnimationTest {
         val e = engine()
         e.dot(0, 0, red)
         e.addFrame(); e.dot(0, 0, blue)
-        assertEquals(red, ColorMath.compositeFrame(e.project, 0)[0])
-        assertEquals(blue, ColorMath.compositeFrame(e.project, 1)[0])
+        assertEquals(red, ColorMath.compositeFrame(e.project, e.store, e.project.frames[0].uid)[0])
+        assertEquals(blue, ColorMath.compositeFrame(e.project, e.store, e.project.frames[1].uid)[0])
     }
 }

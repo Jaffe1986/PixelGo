@@ -1,65 +1,99 @@
 package com.pixelgo.editor
 
+import com.pixelgo.model.AudioClip
 import com.pixelgo.model.Frame
 import com.pixelgo.model.Layer
 import com.pixelgo.model.PixelProject
+import com.pixelgo.model.SoundTrack
 
-/** A reversible change to a project. */
+/**
+ * A reversible change to a project. Edits are pushed AFTER the change has been applied.
+ *
+ * Pixel data of deleted layers/frames is not copied into edits: their cels stay in the
+ * [CelStore] while any undo/redo entry still refers to them ([collectRefs]); saving only
+ * removes cels nothing refers to any more.
+ */
 sealed interface Edit {
-    fun undo(p: PixelProject)
-    fun redo(p: PixelProject)
+    fun undo(p: PixelProject, s: CelStore)
+    fun redo(p: PixelProject, s: CelStore)
+
+    /** Adds the layer ids / frame uids this edit may bring back. */
+    fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {}
+
+    /** Adds the audio asset ids this edit may bring back. */
+    fun collectAssetRefs(assets: MutableSet<Long>) {}
 }
 
-/** Pixel changes on a single layer + frame (one stroke, fill, cut, move...). */
+/** Pixel changes on one cel (one stroke, fill, cut, move...). */
 class PixelEdit(
-    private val layerId: Long,
-    val frame: Int,
+    val layerId: Long,
+    val frameUid: Long,
     private val indices: IntArray,
     private val before: IntArray,
     private val after: IntArray,
 ) : Edit {
     val changedIndices: IntArray get() = indices
 
-    override fun undo(p: PixelProject) = apply(p, before)
-    override fun redo(p: PixelProject) = apply(p, after)
+    override fun undo(p: PixelProject, s: CelStore) = apply(p, s, before)
+    override fun redo(p: PixelProject, s: CelStore) = apply(p, s, after)
 
-    private fun apply(p: PixelProject, values: IntArray) {
-        val idx = p.indexOfLayer(layerId)
-        if (idx < 0 || frame !in p.frames.indices) return
-        val px = p.layers[idx].cels[frame]
+    private fun apply(p: PixelProject, s: CelStore, values: IntArray) {
+        val li = p.indexOfLayer(layerId)
+        if (li < 0 || p.indexOfFrame(frameUid) < 0) return
+        val px = s.edit(layerId, frameUid)
         for (k in indices.indices) px[indices[k]] = values[k]
-        p.activeLayerIndex = idx
-        p.currentFrame = frame // show the user what changed
+        // Show the user what changed.
+        p.activeLayerIndex = li
+        p.currentFrameUid = frameUid
+    }
+
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        layers += layerId
+        frames += frameUid
     }
 }
 
+// ---- Layers ---------------------------------------------------------------------------------
+
 class AddLayerEdit(private val index: Int, private val layer: Layer) : Edit {
-    override fun undo(p: PixelProject) {
+    override fun undo(p: PixelProject, s: CelStore) {
         p.layers.removeAt(index)
         p.activeLayerIndex = (index - 1).coerceIn(0, p.layers.lastIndex)
+        p.touchLayers()
     }
 
-    override fun redo(p: PixelProject) {
+    override fun redo(p: PixelProject, s: CelStore) {
         p.layers.add(index, layer)
         p.activeLayerIndex = index
+        p.touchLayers()
+    }
+
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        layers += layer.id
     }
 }
 
 class DeleteLayerEdit(private val index: Int, private val layer: Layer) : Edit {
-    override fun undo(p: PixelProject) {
+    override fun undo(p: PixelProject, s: CelStore) {
         p.layers.add(index, layer)
         p.activeLayerIndex = index
+        p.touchLayers()
     }
 
-    override fun redo(p: PixelProject) {
+    override fun redo(p: PixelProject, s: CelStore) {
         p.layers.removeAt(index)
         p.activeLayerIndex = index.coerceAtMost(p.layers.lastIndex).coerceAtLeast(0)
+        p.touchLayers()
+    }
+
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        layers += layer.id
     }
 }
 
 class MoveLayerEdit(private val from: Int, private val to: Int) : Edit {
-    override fun undo(p: PixelProject) = move(p, to, from)
-    override fun redo(p: PixelProject) = move(p, from, to)
+    override fun undo(p: PixelProject, s: CelStore) = move(p, to, from)
+    override fun redo(p: PixelProject, s: CelStore) = move(p, from, to)
 
     companion object {
         fun move(p: PixelProject, from: Int, to: Int) {
@@ -67,29 +101,41 @@ class MoveLayerEdit(private val from: Int, private val to: Int) : Edit {
             val l = p.layers.removeAt(from)
             p.layers.add(to, l)
             p.activeLayerIndex = p.layers.indexOf(active)
+            p.touchLayers()
         }
     }
 }
 
-/** Merge down across all frames. [lowerBefore]/[lowerAfter] hold one cel per frame. */
+/**
+ * Merge down = [lower] and [upper] are replaced by a brand-new layer [merged] (its cels were
+ * written by the merge job). Undo just swaps the originals back, so no pixel copies are kept.
+ */
 class MergeDownEdit(
-    private val upperIndex: Int,
+    private val lowerIndex: Int,
+    private val lower: Layer,
     private val upper: Layer,
-    private val lowerBefore: List<IntArray>,
-    private val lowerAfter: List<IntArray>,
+    private val merged: Layer,
 ) : Edit {
-    override fun undo(p: PixelProject) {
-        val lower = p.layers[upperIndex - 1]
-        lowerBefore.forEachIndexed { f, cel -> cel.copyInto(lower.cels[f]) }
-        p.layers.add(upperIndex, upper)
-        p.activeLayerIndex = upperIndex
+    override fun undo(p: PixelProject, s: CelStore) {
+        p.layers.removeAt(lowerIndex)
+        p.layers.add(lowerIndex, lower)
+        p.layers.add(lowerIndex + 1, upper)
+        p.activeLayerIndex = lowerIndex + 1
+        p.touchLayers()
     }
 
-    override fun redo(p: PixelProject) {
-        p.layers.removeAt(upperIndex)
-        val lower = p.layers[upperIndex - 1]
-        lowerAfter.forEachIndexed { f, cel -> cel.copyInto(lower.cels[f]) }
-        p.activeLayerIndex = upperIndex - 1
+    override fun redo(p: PixelProject, s: CelStore) {
+        p.layers.removeAt(lowerIndex + 1)
+        p.layers.removeAt(lowerIndex)
+        p.layers.add(lowerIndex, merged)
+        p.activeLayerIndex = lowerIndex
+        p.touchLayers()
+    }
+
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        layers += lower.id
+        layers += upper.id
+        layers += merged.id
     }
 }
 
@@ -100,71 +146,193 @@ class LayerPropsEdit(
     private val oldVisible: Boolean,
     private val newVisible: Boolean,
 ) : Edit {
-    override fun undo(p: PixelProject) = set(p, oldName, oldVisible)
-    override fun redo(p: PixelProject) = set(p, newName, newVisible)
+    override fun undo(p: PixelProject, s: CelStore) = set(p, oldName, oldVisible)
+    override fun redo(p: PixelProject, s: CelStore) = set(p, newName, newVisible)
 
     private fun set(p: PixelProject, name: String, visible: Boolean) {
         val l = p.layers.getOrNull(p.indexOfLayer(layerId)) ?: return
         l.name = name
-        l.visible = visible
+        if (l.visible != visible) {
+            l.visible = visible
+            p.touchLayers()
+        }
+    }
+
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        layers += layerId
     }
 }
 
-// ---- Frames ------------------------------------------------------------------------------
+// ---- Frames ---------------------------------------------------------------------------------
 
-/** Inserting a frame at [index]; [cels] maps layer id -> that layer's cel for the frame. */
-class AddFrameEdit(
-    private val index: Int,
-    private val frame: Frame,
-    private val cels: Map<Long, IntArray>,
+/** [frames] were inserted at [index] (their cels already exist in the store). */
+class InsertFramesEdit(private val index: Int, private val frames: List<Frame>) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) {
+        p.removeFrames(index, frames.size)
+        p.currentFrameUid = p.frames[(index - 1).coerceIn(0, p.frames.lastIndex)].uid
+    }
+
+    override fun redo(p: PixelProject, s: CelStore) {
+        p.insertFrames(index, frames)
+        p.currentFrameUid = frames.first().uid
+    }
+
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        this.frames.forEach { frames += it.uid }
+    }
+}
+
+/** [frames] were removed from [index]. Their cels stay in the store for undo. */
+class DeleteFramesEdit(private val index: Int, private val frames: List<Frame>) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) {
+        p.insertFrames(index, frames)
+        p.currentFrameUid = frames.first().uid
+    }
+
+    override fun redo(p: PixelProject, s: CelStore) {
+        p.removeFrames(index, frames.size)
+        p.currentFrameUid = p.frames[index.coerceAtMost(p.frames.lastIndex)].uid
+    }
+
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        this.frames.forEach { frames += it.uid }
+    }
+}
+
+/** [count] frames moved from [from] so the first sits at [to] (index after removal). */
+class MoveFramesEdit(private val from: Int, private val count: Int, private val to: Int) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) = p.moveFrames(to, count, from)
+    override fun redo(p: PixelProject, s: CelStore) = p.moveFrames(from, count, to)
+}
+
+class ReverseFramesEdit(private val from: Int, private val count: Int) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) = p.reverseFrames(from, count)
+    override fun redo(p: PixelProject, s: CelStore) = p.reverseFrames(from, count)
+}
+
+class SetHoldsEdit(
+    private val uids: LongArray,
+    private val old: IntArray,
+    private val new: IntArray,
 ) : Edit {
-    override fun undo(p: PixelProject) = FrameOps.remove(p, index)
-    override fun redo(p: PixelProject) = FrameOps.insert(p, index, frame, cels)
+    override fun undo(p: PixelProject, s: CelStore) = apply(p, old)
+    override fun redo(p: PixelProject, s: CelStore) = apply(p, new)
+
+    private fun apply(p: PixelProject, holds: IntArray) {
+        uids.forEachIndexed { k, uid ->
+            val i = p.indexOfFrame(uid)
+            if (i >= 0) p.setHold(p.frames[i], holds[k])
+        }
+        if (uids.isNotEmpty() && p.indexOfFrame(uids[0]) >= 0) p.currentFrameUid = uids[0]
+    }
 }
 
-class DeleteFrameEdit(
+/** Several edits that undo/redo as one step. */
+class CompoundEdit(private val edits: List<Edit>) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) = edits.asReversed().forEach { it.undo(p, s) }
+    override fun redo(p: PixelProject, s: CelStore) = edits.forEach { it.redo(p, s) }
+    override fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) =
+        edits.forEach { it.collectRefs(layers, frames) }
+    override fun collectAssetRefs(assets: MutableSet<Long>) = edits.forEach { it.collectAssetRefs(assets) }
+}
+
+// ---- Audio ----------------------------------------------------------------------------------
+
+class AddClipEdit(private val clip: AudioClip) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) {
+        p.clips.removeAll { it.id == clip.id }
+        p.touchAudio()
+    }
+
+    override fun redo(p: PixelProject, s: CelStore) {
+        p.clips.add(clip)
+        p.touchAudio()
+    }
+
+    override fun collectAssetRefs(assets: MutableSet<Long>) {
+        assets += clip.assetId
+    }
+}
+
+class RemoveClipEdit(private val index: Int, private val clip: AudioClip) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) {
+        p.clips.add(index.coerceIn(0, p.clips.size), clip)
+        p.touchAudio()
+    }
+
+    override fun redo(p: PixelProject, s: CelStore) {
+        p.clips.removeAll { it.id == clip.id }
+        p.touchAudio()
+    }
+
+    override fun collectAssetRefs(assets: MutableSet<Long>) {
+        assets += clip.assetId
+    }
+}
+
+/** A clip moved, trimmed, re-tracked or changed volume. */
+class ChangeClipEdit(private val old: AudioClip, private val new: AudioClip) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) = put(p, old)
+    override fun redo(p: PixelProject, s: CelStore) = put(p, new)
+
+    private fun put(p: PixelProject, c: AudioClip) {
+        val i = p.indexOfClip(c.id)
+        if (i >= 0) p.clips[i] = c
+        p.touchAudio()
+    }
+
+    override fun collectAssetRefs(assets: MutableSet<Long>) {
+        assets += old.assetId
+    }
+}
+
+class AddTrackEdit(private val index: Int, private val track: SoundTrack) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) {
+        p.tracks.removeAll { it.id == track.id }
+        p.touchAudio()
+    }
+
+    override fun redo(p: PixelProject, s: CelStore) {
+        p.tracks.add(index.coerceIn(0, p.tracks.size), track)
+        p.touchAudio()
+    }
+}
+
+/** A track and all its clips were removed. */
+class RemoveTrackEdit(
     private val index: Int,
-    private val frame: Frame,
-    private val cels: Map<Long, IntArray>,
+    private val track: SoundTrack,
+    private val clips: List<Pair<Int, AudioClip>>,
 ) : Edit {
-    override fun undo(p: PixelProject) = FrameOps.insert(p, index, frame, cels)
-    override fun redo(p: PixelProject) = FrameOps.remove(p, index)
-}
-
-class MoveFrameEdit(private val from: Int, private val to: Int) : Edit {
-    override fun undo(p: PixelProject) = FrameOps.move(p, to, from)
-    override fun redo(p: PixelProject) = FrameOps.move(p, from, to)
-}
-
-class FrameHoldEdit(private val index: Int, private val old: Int, private val new: Int) : Edit {
-    override fun undo(p: PixelProject) { p.frames[index].hold = old; p.currentFrame = index }
-    override fun redo(p: PixelProject) { p.frames[index].hold = new; p.currentFrame = index }
-}
-
-object FrameOps {
-    fun insert(p: PixelProject, index: Int, frame: Frame, cels: Map<Long, IntArray>) {
-        p.frames.add(index, frame)
-        for (l in p.layers) l.cels.add(index, cels[l.id] ?: IntArray(p.size))
-        p.currentFrame = index
+    override fun undo(p: PixelProject, s: CelStore) {
+        p.tracks.add(index.coerceIn(0, p.tracks.size), track)
+        clips.forEach { (i, c) -> p.clips.add(i.coerceIn(0, p.clips.size), c) }
+        p.touchAudio()
     }
 
-    fun remove(p: PixelProject, index: Int) {
-        p.frames.removeAt(index)
-        for (l in p.layers) l.cels.removeAt(index)
-        p.currentFrame = index.coerceAtMost(p.frames.lastIndex)
+    override fun redo(p: PixelProject, s: CelStore) {
+        p.tracks.removeAll { it.id == track.id }
+        p.clips.removeAll { it.trackId == track.id }
+        p.touchAudio()
     }
 
-    fun move(p: PixelProject, from: Int, to: Int) {
-        p.frames.add(to, p.frames.removeAt(from))
-        for (l in p.layers) l.cels.add(to, l.cels.removeAt(from))
-        p.currentFrame = to
+    override fun collectAssetRefs(assets: MutableSet<Long>) {
+        clips.forEach { assets += it.second.assetId }
     }
-
-    fun celsAt(p: PixelProject, index: Int): Map<Long, IntArray> =
-        p.layers.associate { it.id to it.cels[index] }
 }
 
-/** Undo / redo stacks with a size cap. */
+class ChangeTrackEdit(private val old: SoundTrack, private val new: SoundTrack) : Edit {
+    override fun undo(p: PixelProject, s: CelStore) = put(p, old)
+    override fun redo(p: PixelProject, s: CelStore) = put(p, new)
+
+    private fun put(p: PixelProject, t: SoundTrack) {
+        val i = p.indexOfTrack(t.id)
+        if (i >= 0) p.tracks[i] = t
+        p.touchAudio()
+    }
+}
+
+/** Undo / redo stacks with a size cap. Main thread only. */
 class History(private val limit: Int = 100) {
     private val undoStack = ArrayDeque<Edit>()
     private val redoStack = ArrayDeque<Edit>()
@@ -179,17 +347,29 @@ class History(private val limit: Int = 100) {
         redoStack.clear()
     }
 
-    fun undo(p: PixelProject): Edit? {
+    fun undo(p: PixelProject, s: CelStore): Edit? {
         val e = undoStack.removeLastOrNull() ?: return null
-        e.undo(p)
+        e.undo(p, s)
         redoStack.addLast(e)
         return e
     }
 
-    fun redo(p: PixelProject): Edit? {
+    fun redo(p: PixelProject, s: CelStore): Edit? {
         val e = redoStack.removeLastOrNull() ?: return null
-        e.redo(p)
+        e.redo(p, s)
         undoStack.addLast(e)
         return e
+    }
+
+    /** Every layer id / frame uid that undo or redo could bring back. */
+    fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
+        undoStack.forEach { it.collectRefs(layers, frames) }
+        redoStack.forEach { it.collectRefs(layers, frames) }
+    }
+
+    /** Every audio asset id that undo or redo could bring back. */
+    fun collectAssetRefs(assets: MutableSet<Long>) {
+        undoStack.forEach { it.collectAssetRefs(assets) }
+        redoStack.forEach { it.collectAssetRefs(assets) }
     }
 }

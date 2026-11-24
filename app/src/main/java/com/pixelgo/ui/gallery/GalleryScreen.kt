@@ -60,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.pixelgo.PixelGoApp
 import com.pixelgo.data.ProjectSummary
+import com.pixelgo.export.ExportJobs
 import com.pixelgo.model.MAX_CANVAS_SIZE
 import com.pixelgo.ui.common.ConfirmDialog
 import com.pixelgo.ui.common.TextInputDialog
@@ -145,8 +146,8 @@ fun GalleryScreen(onOpen: (String) -> Unit, onPalettes: () -> Unit) {
             onCreate = { name, w, h ->
                 showNew = false
                 scope.launch {
-                    val p = withContext(repo.dispatcher) { repo.create(name, w, h) }
-                    onOpen(p.id)
+                    val id = withContext(repo.dispatcher) { repo.create(name, w, h) }
+                    onOpen(id)
                 }
             },
         )
@@ -201,15 +202,25 @@ private fun ProjectCard(
                 }
             }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(text = { Text("Rename") }, onClick = { menu = false; onRename() })
-                DropdownMenuItem(text = { Text("Duplicate") }, onClick = { menu = false; onDuplicate() })
-                DropdownMenuItem(text = { Text("Delete") }, onClick = { menu = false; onDelete() })
+                // Not while a video of this project is being exported (it reads the project's files).
+                val free = !ExportJobs.isExporting(p.id)
+                DropdownMenuItem(text = { Text("Rename") }, enabled = free, onClick = { menu = false; onRename() })
+                DropdownMenuItem(text = { Text("Duplicate") }, enabled = free, onClick = { menu = false; onDuplicate() })
+                DropdownMenuItem(text = { Text("Delete") }, enabled = free, onClick = { menu = false; onDelete() })
             }
         }
         Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
             Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
+            ExportJobs.state?.takeIf { it.projectId == p.id && !it.done }?.let {
+                Text(
+                    "Exporting video… ${(it.progress * 100).toInt()}%",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
             Text(
-                "${p.width} × ${p.height}" + if (p.frameCount > 1) "  ·  ${p.frameCount} frames" else "",
+                "${p.width} × ${p.height}" +
+                    if (p.frameCount > 1) "  ·  ${p.frameCount} frames  ·  ${"%.1f".format(p.durationMs / 1000.0)} s" else "",
                 style = MaterialTheme.typography.bodySmall,
             )
         }

@@ -213,9 +213,8 @@ private fun LayerRow(
     modifier: Modifier,
     handleModifier: Modifier,
 ) {
-    val thumb = remember(layer, vm.renderTick, vm.structureTick) {
-        Bitmap.createBitmap(layer.pixels, vm.width, vm.height, Bitmap.Config.ARGB_8888).asImageBitmap()
-    }
+    // Pixels of this layer on the current frame (null = empty layer on this frame).
+    val thumb = remember(layer.id, vm.renderTick, vm.structureTick) { vm.layerThumb(layer.id) }
     Row(
         modifier
             .fillMaxWidth()
@@ -237,12 +236,14 @@ private fun LayerRow(
             val h = vm.height * s
             val rect = Rect(Offset((size.width - w) / 2, (size.height - h) / 2), Size(w, h))
             drawCheckerboard(rect, 5.dp.toPx())
-            drawImage(
-                thumb,
-                dstOffset = IntOffset(rect.left.roundToInt(), rect.top.roundToInt()),
-                dstSize = IntSize(w.roundToInt().coerceAtLeast(1), h.roundToInt().coerceAtLeast(1)),
-                filterQuality = FilterQuality.None,
-            )
+            if (thumb != null) {
+                drawImage(
+                    thumb,
+                    dstOffset = IntOffset(rect.left.roundToInt(), rect.top.roundToInt()),
+                    dstSize = IntSize(w.roundToInt().coerceAtLeast(1), h.roundToInt().coerceAtLeast(1)),
+                    filterQuality = FilterQuality.None,
+                )
+            }
         }
         Spacer(Modifier.width(10.dp))
         Text(

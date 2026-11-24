@@ -58,11 +58,27 @@ object PngExporter {
     fun pngFile(img: ExportImage, w: Int, h: Int, scale: Int) =
         ExportFile(img.name + ".png", "image/png") { writePng(img.pixels, w, h, scale, it) }
 
-    fun sheetFile(name: String, frames: List<IntArray>, w: Int, h: Int, scale: Int) =
-        ExportFile("$name.png", "image/png") { writeSheet(frames, w, h, scale, it) }
+    /** PNG whose pixels are produced only when the file is written (off the main thread). */
+    fun pngFile(name: String, w: Int, h: Int, scale: Int, pixels: () -> IntArray) =
+        ExportFile("$name.png", "image/png") { writePng(pixels(), w, h, scale, it) }
 
-    fun gifFile(name: String, frames: List<IntArray>, delaysCs: List<Int>, w: Int, h: Int, scale: Int) =
-        ExportFile("$name.gif", "image/gif") { GifEncoder.encode(frames, w, h, scale, delaysCs, it) }
+    /** Sprite sheet; [frame] renders frame i (called off the main thread while writing). */
+    fun sheetFile(name: String, frameCount: Int, frame: (Int) -> IntArray, w: Int, h: Int, scale: Int) =
+        ExportFile("$name.png", "image/png") { writeSheet(frameCount, frame, w, h, scale, it) }
+
+    /** Animated GIF; [frame] renders frame i (called off the main thread while writing). */
+    fun gifFile(
+        name: String,
+        frameCount: Int,
+        frame: (Int) -> IntArray,
+        delaysCs: IntArray,
+        w: Int,
+        h: Int,
+        scale: Int,
+        progress: (Float) -> Unit = {},
+    ) = ExportFile("$name.gif", "image/gif") {
+        GifEncoder.encode(frameCount, frame, w, h, scale, delaysCs, it, progress)
+    }
 
     private fun writePng(pixels: IntArray, w: Int, h: Int, scale: Int, out: OutputStream) {
         val ow = w * scale
@@ -77,14 +93,15 @@ object PngExporter {
         bmp.recycle()
     }
 
-    private fun writeSheet(frames: List<IntArray>, w: Int, h: Int, scale: Int, out: OutputStream) {
+    private fun writeSheet(frameCount: Int, frame: (Int) -> IntArray, w: Int, h: Int, scale: Int, out: OutputStream) {
         val fw = w * scale
         val fh = h * scale
-        val (cols, rows) = sheetGrid(frames.size, fw)
+        val (cols, rows) = sheetGrid(frameCount, fw)
         val bmp = Bitmap.createBitmap(cols * fw, rows * fh, Bitmap.Config.ARGB_8888)
         bmp.setHasAlpha(true)
         val row = IntArray(fw)
-        frames.forEachIndexed { f, px ->
+        for (f in 0 until frameCount) {
+            val px = frame(f)
             val ox = (f % cols) * fw
             val oy = (f / cols) * fh
             for (y in 0 until h) {

@@ -1,13 +1,13 @@
 package com.pixelgo
 
+import com.pixelgo.data.MetaSerializer
 import com.pixelgo.data.PaletteSerializer
-import com.pixelgo.data.ProjectSerializer
 import com.pixelgo.editor.ColorMath
 import com.pixelgo.editor.EditorEngine
+import com.pixelgo.editor.MemoryCelStore
 import com.pixelgo.editor.Raster
 import com.pixelgo.model.Palette
 import com.pixelgo.model.PixelProject
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -15,15 +15,23 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 
+/** Engine on an in-memory cel store. */
+fun testEngine(w: Int = 8, h: Int = 8) = EditorEngine(PixelProject.create("t", "Test", w, h), MemoryCelStore(w * h))
+
+/** Pixel of a layer (index) on the current frame; 0 when the cel is empty. */
+fun EditorEngine.px(x: Int, y: Int, layer: Int = project.activeLayerIndex): Int =
+    store.read(project.layers[layer].id, project.currentFrameUid)?.get(y * width + x) ?: 0
+
+fun EditorEngine.dot(x: Int, y: Int, c: Int) {
+    beginStroke(x, y, c)
+    endStroke()
+}
+
 class EngineTest {
     private val red = 0xFFFF0000.toInt()
     private val blue = 0xFF0000FF.toInt()
 
-    private fun engine(w: Int = 8, h: Int = 8) = EditorEngine(PixelProject.create("t", "Test", w, h))
-    private fun EditorEngine.px(x: Int, y: Int, layer: Int = project.activeLayerIndex) =
-        project.layers[layer].pixels[y * width + x]
-
-    private fun EditorEngine.dot(x: Int, y: Int, c: Int) { beginStroke(x, y, c); endStroke() }
+    private fun engine(w: Int = 8, h: Int = 8) = testEngine(w, h)
 
     @Test fun mirrorPointsEvenWidth() {
         val pts = mutableListOf<Pair<Int, Int>>()
@@ -132,8 +140,16 @@ class EngineTest {
         e.dot(0, 0, red)
         e.addLayer()
         e.dot(1, 0, blue)
-        e.mergeDown()
+        val lowerId = e.project.layers[0].id
+        val upperId = e.project.layers[1].id
+        e.mergeDownJob()!!.let { it.runWork {}; it.finish() }
         assertEquals(1, e.project.layers.size)
+        // The result is a NEW layer, so undo needs no pixel copies.
+        val mergedId = e.project.layers[0].id
+        assertTrue(mergedId != lowerId && mergedId != upperId)
+        val refs = HashSet<Long>()
+        e.collectRefs(refs, HashSet())
+        assertTrue(refs.containsAll(listOf(lowerId, upperId, mergedId)))
         assertEquals(blue, e.px(1, 0, 0))
         e.undo()
         assertEquals(2, e.project.layers.size)
@@ -173,22 +189,24 @@ class EngineTest {
         assertEquals(red, out[35])
     }
 
-    @Test fun projectRoundTrip() {
+    @Test fun projectMetaRoundTrip() {
         val e = engine(3, 2)
         e.dot(1, 1, 0x40ABCDEF)
         e.addLayer()
         e.renameLayer(1, "Top")
         e.setLayerVisible(1, false)
-        val bytes = ByteArrayOutputStream().also { ProjectSerializer.write(e.project, 123L, it) }.toByteArray()
-        val header = ProjectSerializer.readHeader(ByteArrayInputStream(bytes))
+        val bytes = ByteArrayOutputStream().also { MetaSerializer.write(e.project, 123L, it) }.toByteArray()
+        val header = MetaSerializer.readHeader(ByteArrayInputStream(bytes))
         assertEquals(3, header.width)
         assertEquals(123L, header.modified)
-        val p = ProjectSerializer.read("t", ByteArrayInputStream(bytes))
+        assertEquals(1, header.frameCount)
+        val p = MetaSerializer.read("t", ByteArrayInputStream(bytes))
         assertEquals(2, p.layers.size)
         assertEquals("Top", p.layers[1].name)
         assertFalse(p.layers[1].visible)
-        assertArrayEquals(e.project.layers[0].pixels, p.layers[0].pixels)
+        assertEquals(e.project.layers.map { it.id }, p.layers.map { it.id })
         assertEquals(e.project.nextLayerId, p.nextLayerId)
+        assertEquals(e.project.activeLayerIndex, p.activeLayerIndex)
     }
 
     // ---- Selection ---------------------------------------------------------------------

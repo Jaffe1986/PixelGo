@@ -2,6 +2,7 @@ package com.pixelgo.ui.editor
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -10,6 +11,10 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
@@ -32,18 +37,26 @@ import com.pixelgo.data.ExportFile
 import com.pixelgo.data.ExportImage
 import com.pixelgo.data.PngExporter
 import com.pixelgo.data.sheetGrid
+import com.pixelgo.data.video.VideoSettings
+import com.pixelgo.data.video.VideoShape
+import com.pixelgo.data.video.VideoSize
+import com.pixelgo.editor.Timing
+import com.pixelgo.ui.common.ColorPickerDialog
+import com.pixelgo.ui.common.ColorSwatch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private val Scales = listOf(1, 2, 4, 8, 16)
 
-private enum class ExportMode(val label: String, val kind: String, val animated: Boolean) {
+private enum class ExportMode(val label: String, val kind: String, val animated: Boolean, val video: Boolean = false) {
     Image("Single image", "image", false),
     Layers("Each layer", "layers", false),
     Gif("Animated GIF", "gif", true),
     Sheet("Sprite sheet", "sheet", true),
     Frames("Each frame", "frames", true),
+    Mp4("Video MP4", "video", true, video = true),
+    Mov("Video MOV", "video", true, video = true),
 }
 
 /** Biggest image side we allow (keeps memory in check). */
@@ -54,10 +67,16 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val animated = vm.frameCount > 1
+    val hasSound = vm.clips().isNotEmpty()
     var scale by remember { mutableIntStateOf(if (vm.width <= 64) 8 else 4) }
     var mode by remember { mutableStateOf(if (animated) ExportMode.Gif else ExportMode.Image) }
     var includeHidden by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
+    // Video options
+    var videoSize by remember { mutableStateOf(VideoSize.P1080) }
+    var videoShape by remember { mutableStateOf(VideoShape.CANVAS) }
+    var background by remember { mutableIntStateOf(0xFFFFFFFF.toInt()) }
+    var pickBackground by remember { mutableStateOf(false) }
 
     val hidden = vm.hiddenLayerCount
     val fw = vm.width * scale
@@ -71,7 +90,12 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
     }
     val outW = if (mode == ExportMode.Sheet) cols * fw else fw
     val outH = if (mode == ExportMode.Sheet) rows * fh else fh
-    val tooBig = outW > MAX_SIDE || outH > MAX_SIDE
+    val tooBig = !mode.video && (outW > MAX_SIDE || outH > MAX_SIDE)
+
+    val videoSettings = VideoSettings(videoSize, videoShape, background, mov = mode == ExportMode.Mov)
+    val preview = remember(mode, videoSize, videoShape, vm.frameCount, vm.fps, vm.structureTick, vm.loopToAudio) {
+        if (mode.video) runCatching { vm.videoPreview(videoSettings)?.let { it to it.layout } }.getOrNull() else null
+    }
 
     val description = when (mode) {
         ExportMode.Image ->
@@ -87,9 +111,17 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
             "All ${vm.frameCount} frames in one transparent PNG, " +
                 (if (rows == 1) "left to right." else "in a $cols × $rows grid (left to right, top to bottom).")
         ExportMode.Frames -> "One transparent PNG per frame, numbered in order."
+        ExportMode.Mp4 -> "H.264 video that plays almost anywhere" + (if (hasSound) ", with your sound (AAC)" else "") +
+            ". Saved to Movies/PixelGo. Video can't be transparent, so pick a background colour."
+        ExportMode.Mov -> "QuickTime video (H.264" + (if (hasSound) " + AAC sound" else "") +
+            ") for Apple devices and video editors. Saved to Movies/PixelGo. Video can't be transparent, so pick a background colour."
     }
 
-    /** Snapshot the pixels now (on the main thread) so later edits don't race the export. */
+    /**
+     * Single images are copied now (on the main thread). Animation frames are rendered one at
+     * a time while the files are written, so any number of frames fits in memory; editing is
+     * blocked while the export runs (the dialog stays open).
+     */
     fun files(): List<ExportFile> {
         val w = vm.width
         val h = vm.height
@@ -98,21 +130,34 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
                 PngExporter.pngFile(ExportImage(PngExporter.fileName(vm.projectName, scale), vm.exportPixels()), w, h, scale)
             )
             ExportMode.Layers -> vm.exportLayers(scale, includeHidden).map { PngExporter.pngFile(it, w, h, scale) }
-            ExportMode.Gif -> listOf(
-                PngExporter.gifFile(PngExporter.fileName(vm.projectName, scale), vm.exportFrames(), vm.frameDelaysCs(), w, h, scale)
-            )
-            ExportMode.Sheet -> listOf(
-                PngExporter.sheetFile(PngExporter.fileName(vm.projectName + " sheet", scale), vm.exportFrames(), w, h, scale)
-            )
-            ExportMode.Frames -> {
-                val frames = vm.exportFrames()
-                val names = PngExporter.layerFileNames(List(frames.size) { "frame" }, scale)
-                frames.mapIndexed { i, px -> PngExporter.pngFile(ExportImage(names[i], px), w, h, scale) }
+            ExportMode.Gif -> {
+                val src = vm.exportFrameSource()
+                listOf(
+                    PngExporter.gifFile(
+                        PngExporter.fileName(vm.projectName, scale), src.count, src.render,
+                        vm.frameDelaysCs(), w, h, scale,
+                    )
+                )
             }
+            ExportMode.Sheet -> {
+                val src = vm.exportFrameSource()
+                listOf(PngExporter.sheetFile(PngExporter.fileName(vm.projectName + " sheet", scale), src.count, src.render, w, h, scale))
+            }
+            ExportMode.Frames -> {
+                val src = vm.exportFrameSource()
+                val names = PngExporter.layerFileNames(List(src.count) { "frame" }, scale)
+                List(src.count) { i -> PngExporter.pngFile(names[i], w, h, scale) { src.render(i) } }
+            }
+            ExportMode.Mp4, ExportMode.Mov -> emptyList()
         }
     }
 
     fun save() {
+        if (mode.video) {
+            vm.startVideoExport(videoSettings)
+            onDismiss()
+            return
+        }
         busy = true
         val list = files()
         val kind = mode.kind
@@ -146,18 +191,20 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
         }
     }
 
-    val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+    val storagePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) save() else Toast.makeText(context, "Storage permission is needed to save", Toast.LENGTH_LONG).show()
     }
+    // Progress notifications for long exports; the export works either way.
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { save() }
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
         title = { Text(if (busy) "Exporting…" else "Export") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("What to export", style = MaterialTheme.typography.labelLarge)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    ExportMode.entries.filter { animated || !it.animated }.forEach { m ->
+                    ExportMode.entries.filter { animated || !it.animated || (it.video && hasSound) }.forEach { m ->
                         FilterChip(selected = mode == m, onClick = { mode = m }, label = { Text(m.label) })
                     }
                 }
@@ -171,20 +218,73 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
                         Text("Include hidden layers ($hidden)")
                     }
                 }
-                Text("Scale", style = MaterialTheme.typography.labelLarge)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Scales.forEach { s ->
-                        FilterChip(selected = scale == s, onClick = { scale = s }, label = { Text("${s}×") })
+                if (mode.video) {
+                    Text("Size", style = MaterialTheme.typography.labelLarge)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        VideoSize.entries.forEach { s ->
+                            FilterChip(selected = videoSize == s, onClick = { videoSize = s }, label = { Text(s.label) })
+                        }
                     }
+                    Text("Shape", style = MaterialTheme.typography.labelLarge)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        VideoShape.entries.forEach { s ->
+                            FilterChip(selected = videoShape == s, onClick = { videoShape = s }, label = { Text(s.label) })
+                        }
+                    }
+                    if (hasSound) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { vm.setLoopToAudio(!vm.loopToAudio) },
+                        ) {
+                            Checkbox(checked = vm.loopToAudio, onCheckedChange = { vm.setLoopToAudio(it) })
+                            Text("Loop the animation until the sound ends")
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { pickBackground = true }) {
+                        Text("Background", style = MaterialTheme.typography.labelLarge)
+                        Spacer(Modifier.width(12.dp))
+                        ColorSwatch(background, size = 32.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Change", color = MaterialTheme.colorScheme.primary)
+                    }
+                    val p = preview
+                    if (p == null) {
+                        Text(
+                            "This phone can't encode that size; try a smaller one.",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    } else {
+                        val (exporter, layout) = p
+                        // The encoder's target bitrate: pixel art usually comes out far smaller (~1/10).
+                        val mb = exporter.bitrate.toLong() * exporter.durationMs / 8 / 1_000_000_000.0
+                        Text(
+                            "${layout.width} × ${layout.height} px  ·  ${Timing.formatMs(exporter.durationMs)}  ·  " +
+                                "up to ${if (mb < 1) "%.1f".format(mb) else "%.0f".format(mb)} MB",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "Pixels are scaled ${layout.scale}× and stay sharp. Long videos keep exporting " +
+                                "if you leave the app; you'll get a notification when it's done.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                } else {
+                    Text("Scale", style = MaterialTheme.typography.labelLarge)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Scales.forEach { s ->
+                            FilterChip(selected = scale == s, onClick = { scale = s }, label = { Text("${s}×") })
+                        }
+                    }
+                    Text(
+                        buildString {
+                            if (fileCount > 1) append("$fileCount files, ")
+                            append("$outW × $outH px")
+                            if (fileCount > 1) append(" each")
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
-                Text(
-                    buildString {
-                        if (fileCount > 1) append("$fileCount files, ")
-                        append("$outW × $outH px")
-                        if (fileCount > 1) append(" each")
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                )
                 if (tooBig) {
                     Text(
                         "Too large — pick a smaller scale (max $MAX_SIDE px per side).",
@@ -195,18 +295,37 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
             }
         },
         confirmButton = {
-            TextButton(enabled = !busy && fileCount > 0 && !tooBig, onClick = {
-                if (PngExporter.needsLegacyPermission &&
-                    ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    permission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                } else {
-                    save()
+            val enabled = !busy && fileCount > 0 && !tooBig && (!mode.video || preview != null)
+            TextButton(enabled = enabled, onClick = {
+                when {
+                    PngExporter.needsLegacyPermission &&
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED ->
+                        storagePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    mode.video && Build.VERSION.SDK_INT >= 33 &&
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED ->
+                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    else -> save()
                 }
-            }) { Text("Save to Pictures") }
+            }) { Text(if (mode.video) "Export video" else if (PngExporter.needsLegacyPermission) "Save" else "Save to Pictures") }
         },
         dismissButton = {
-            TextButton(enabled = !busy && fileCount > 0 && !tooBig, onClick = ::share) { Text("Share") }
+            if (mode.video) {
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            } else {
+                TextButton(enabled = !busy && fileCount > 0 && !tooBig, onClick = ::share) { Text("Share") }
+            }
         },
     )
+
+    if (pickBackground) {
+        ColorPickerDialog(
+            initial = background,
+            recent = emptyList(),
+            onDismiss = { pickBackground = false },
+            onConfirm = {
+                pickBackground = false
+                background = it or (0xFF shl 24) // video backgrounds are always opaque
+            },
+        )
+    }
 }

@@ -13,6 +13,10 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+
+        // On-device media tests (src/androidTest). Run them as described in CLAUDE.md, NOT with
+        // connectedAndroidTest, which uninstalls the app afterwards and deletes its projects.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildFeatures {
@@ -41,4 +45,7 @@ dependencies {
     implementation(libs.navigation.compose)
 
     testImplementation(libs.junit)
+
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.runner)
 }

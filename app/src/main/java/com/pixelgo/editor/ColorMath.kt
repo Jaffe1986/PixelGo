@@ -21,32 +21,41 @@ object ColorMath {
         return (a shl 24) or (r shl 16) or (g shl 8) or b
     }
 
-    /** Composite color of pixel [i] across all visible layers. */
-    fun compositeAt(project: PixelProject, i: Int): Int {
+    /** Composite of pixel [i] through [cels] (bottom to top; null = empty layer). */
+    fun compositePixel(cels: Array<IntArray?>, i: Int): Int {
         var c = 0
-        for (layer in project.layers) {
-            if (layer.visible) c = blend(c, layer.pixels[i])
+        for (cel in cels) {
+            if (cel == null) continue
+            val s = cel[i]
+            if (s != 0) c = blend(c, s)
         }
         return c
     }
 
-    /** Composite of the current frame. */
-    fun compositeAll(project: PixelProject, out: IntArray = IntArray(project.size)): IntArray =
-        compositeFrame(project, project.currentFrame, out)
-
-    /** Composite of visible layers on [frame]. */
-    fun compositeFrame(project: PixelProject, frame: Int, out: IntArray = IntArray(project.size)): IntArray {
+    /** Composite of all pixels through [cels] into [out]. */
+    fun compositeCels(cels: Array<IntArray?>, out: IntArray): IntArray {
         out.fill(0)
-        for (layer in project.layers) {
-            if (!layer.visible) continue
-            val px = layer.cels[frame]
+        for (cel in cels) {
+            if (cel == null) continue
             for (i in out.indices) {
-                val s = px[i]
+                val s = cel[i]
                 if (s != 0) out[i] = blend(out[i], s)
             }
         }
         return out
     }
+
+    /** Composite of the given layers (bottom to top) on one frame, read from [store]. */
+    fun compositeFrame(
+        layerIds: LongArray,
+        store: CelStore,
+        frameUid: Long,
+        out: IntArray = IntArray(store.celSize),
+    ): IntArray = compositeCels(Array(layerIds.size) { store.read(layerIds[it], frameUid) }, out)
+
+    /** Composite of the visible layers of [project] on frame [frameUid]. */
+    fun compositeFrame(project: PixelProject, store: CelStore, frameUid: Long): IntArray =
+        compositeFrame(project.visibleLayerIds(), store, frameUid, IntArray(project.size))
 
     fun toHex(color: Int): String = "#%08X".format(color)
 

@@ -6,7 +6,8 @@ build/
 # Local machine config (SDK path)
 local.properties
 
-# Android Studio / IntelliJ
+# Editors (Android Studio / IntelliJ, VS Code)
+.vscode/
 .idea/
 *.iml
 captures/
