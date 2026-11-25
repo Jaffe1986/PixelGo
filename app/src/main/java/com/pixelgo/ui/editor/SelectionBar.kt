@@ -1,123 +1,69 @@
 package com.pixelgo.ui.editor
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Deselect
 import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.SelectAll
-import androidx.compose.material3.Button
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
-import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.pixelgo.ui.common.ActionBar
+import com.pixelgo.ui.common.BarAction
+import com.pixelgo.ui.common.PrimaryButton
+import com.pixelgo.ui.common.SecondaryButton
+import com.pixelgo.ui.common.Segmented
+import com.pixelgo.ui.theme.Pg
 
-/** Actions for the Select tool, shown above the palette strip. */
+/** Actions for the Select tool, shown above the timeline. */
 @Composable
 fun SelectionBar(vm: EditorViewModel) {
     if (vm.isFloating) {
+        // Moved or pasted pixels float until they're dropped (Done) or put back (Cancel).
         Row(
-            Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 12.dp),
+            Modifier.fillMaxWidth().height(Pg.ActionBarHeight).background(Pg.Surface2).padding(horizontal = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text(
-                "Drag to position",
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.weight(1f),
-            )
-            OutlinedButton(onClick = vm::cancelFloating) {
-                Icon(Icons.Filled.Close, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(4.dp))
-                Text("Cancel")
-            }
-            Spacer(Modifier.width(8.dp))
-            Button(onClick = vm::commitFloating) {
-                Icon(Icons.Filled.Check, null, Modifier.size(18.dp))
-                Spacer(Modifier.width(4.dp))
-                Text("Done")
-            }
+            Text("Drag to position", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+            SecondaryButton("Cancel", onClick = vm::cancelFloating, icon = Icons.Filled.Close)
+            PrimaryButton("Done", onClick = vm::commitFloating, icon = Icons.Filled.Check)
         }
         return
     }
 
     val sel = vm.hasSelection
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .height(56.dp)
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        BarButton(Icons.Filled.Crop, "Box", selected = vm.selectMode == SelectMode.Rect) {
-            vm.selectMode = SelectMode.Rect
-        }
-        BarButton(Icons.Filled.Brush, "Paint", selected = vm.selectMode == SelectMode.Paint) {
-            vm.selectMode = SelectMode.Paint
-        }
-        VerticalDivider(Modifier.height(32.dp).padding(horizontal = 4.dp))
-        BarButton(Icons.Filled.ContentCopy, "Copy", enabled = sel, onClick = vm::copySelection)
-        BarButton(Icons.Filled.ContentCut, "Cut", enabled = sel, onClick = vm::cutSelection)
-        BarButton(Icons.Filled.OpenWith, "Move", enabled = sel, onClick = vm::moveSelection)
-        BarButton(Icons.Filled.ContentPaste, "Paste", enabled = PixelClipboard.clip != null, onClick = vm::paste)
-        BarButton(Icons.Filled.Delete, "Delete", enabled = sel, onClick = vm::deleteSelection)
-        VerticalDivider(Modifier.height(32.dp).padding(horizontal = 4.dp))
-        BarButton(Icons.Filled.SelectAll, "All", onClick = vm::selectAll)
-        BarButton(Icons.Filled.Deselect, "None", enabled = sel, onClick = vm::deselect)
-    }
-}
-
-@Composable
-private fun BarButton(
-    icon: ImageVector,
-    label: String,
-    selected: Boolean = false,
-    enabled: Boolean = true,
-    onClick: () -> Unit,
-) {
-    val bg = if (selected) MaterialTheme.colorScheme.secondary else Color.Transparent
-    val fg = if (selected) MaterialTheme.colorScheme.onSecondary else MaterialTheme.colorScheme.onSurface
-    Column(
-        Modifier
-            .clip(RoundedCornerShape(10.dp))
-            .background(bg)
-            .clickable(enabled = enabled, onClick = onClick)
-            .alpha(if (enabled) 1f else 0.35f)
-            .padding(horizontal = 8.dp, vertical = 3.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Icon(icon, label, tint = fg, modifier = Modifier.size(22.dp))
-        Text(label, color = fg, fontSize = 10.sp, maxLines = 1)
-    }
+    ActionBar(
+        start = {
+            Segmented(
+                listOf(SelectMode.Rect, SelectMode.Paint), vm.selectMode, { vm.selectMode = it },
+                label = { if (it == SelectMode.Rect) "Box" else "Paint" },
+                modifier = Modifier.padding(start = 4.dp, end = 4.dp).width(112.dp),
+            )
+        },
+        actions = listOf(
+            BarAction("Move", Icons.Filled.OpenWith, enabled = sel, onClick = vm::moveSelection),
+            BarAction("Copy", Icons.Filled.ContentCopy, enabled = sel, onClick = vm::copySelection),
+            BarAction("Paste", Icons.Filled.ContentPaste, enabled = PixelClipboard.clip != null, onClick = vm::paste),
+            BarAction("Delete", Icons.Filled.Delete, enabled = sel, destructive = true, onClick = vm::deleteSelection),
+            BarAction("Cut", Icons.Filled.ContentCut, enabled = sel, onClick = vm::cutSelection),
+            BarAction("Select all", Icons.Filled.SelectAll, onClick = vm::selectAll),
+            BarAction("Select none", Icons.Filled.Deselect, enabled = sel, onClick = vm::deselect),
+        ),
+    )
 }

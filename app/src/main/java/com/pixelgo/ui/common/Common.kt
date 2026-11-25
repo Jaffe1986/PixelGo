@@ -11,7 +11,6 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -19,6 +18,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.foundation.layout.padding
+import com.pixelgo.editor.ColorMath
+import com.pixelgo.ui.theme.Pg
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -64,24 +69,29 @@ fun DrawScope.drawCheckerboard(rect: Rect, cell: Float, clip: Rect = Rect(Offset
     }
 }
 
-/** A color square that shows a checkerboard underneath so alpha is visible. */
+/**
+ * A color square that shows a checkerboard underneath so alpha is visible. The current color
+ * gets a yellow ring with a small gap. [label] is what TalkBack reads (default: the hex code).
+ */
 @Composable
 fun ColorSwatch(
     color: Int,
     modifier: Modifier = Modifier,
-    size: Dp = 36.dp,
+    size: Dp = Pg.Swatch,
     selected: Boolean = false,
+    label: String? = null,
 ) {
     val shape = RoundedCornerShape(6.dp)
     Box(
         modifier
             .size(size)
+            .semantics {
+                contentDescription = label ?: ColorMath.toHex(color)
+                this.selected = selected
+            }
+            .then(if (selected) Modifier.border(2.dp, Pg.Accent, RoundedCornerShape(8.dp)).padding(4.dp) else Modifier)
             .clip(shape)
-            .border(
-                if (selected) 3.dp else 1.dp,
-                if (selected) MaterialTheme.colorScheme.primary else Color(0x55FFFFFF),
-                shape,
-            )
+            .border(1.dp, Color(0x33FFFFFF), shape)
     ) {
         Canvas(Modifier.fillMaxSize()) {
             drawCheckerboard(Rect(Offset.Zero, this.size), this.size.width / 4f)
@@ -111,27 +121,33 @@ fun TextInputDialog(
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
             )
         },
-        confirmButton = {
-            TextButton(enabled = text.isNotBlank(), onClick = { onConfirm(text.trim()) }) { Text(confirmLabel) }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        confirmButton = { PrimaryButton(confirmLabel, onClick = { onConfirm(text.trim()) }, enabled = text.isNotBlank()) },
+        dismissButton = { PgTextButton("Cancel", onClick = onDismiss) },
     )
 }
 
+/**
+ * Asks before doing something. Only for actions that can't be undone (or where the owner chose
+ * to ask, like merging layers); undoable actions act at once and offer Undo instead.
+ * [destructive] makes the confirm button red.
+ */
 @Composable
 fun ConfirmDialog(
     title: String,
     message: String,
     confirmLabel: String,
     onDismiss: () -> Unit,
+    destructive: Boolean = false,
     onConfirm: () -> Unit,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = { Text(message) },
-        confirmButton = { TextButton(onClick = onConfirm) { Text(confirmLabel) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        confirmButton = {
+            if (destructive) DangerButton(confirmLabel, onClick = onConfirm) else PrimaryButton(confirmLabel, onClick = onConfirm)
+        },
+        dismissButton = { PgTextButton("Cancel", onClick = onDismiss) },
     )
 }
 

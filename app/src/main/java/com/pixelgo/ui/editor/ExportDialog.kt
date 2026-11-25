@@ -16,11 +16,16 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import com.pixelgo.ui.common.Hint
+import com.pixelgo.ui.common.PgTextButton
+import com.pixelgo.ui.common.PrimaryButton
+import com.pixelgo.ui.common.SecondaryButton
+import com.pixelgo.ui.common.SectionLabel
+import com.pixelgo.ui.common.SwitchRow
+import com.pixelgo.ui.theme.Pg
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -202,50 +207,38 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
         title = { Text(if (busy) "Exporting…" else "Export") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("What to export", style = MaterialTheme.typography.labelLarge)
+                SectionLabel("What to export")
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     ExportMode.entries.filter { animated || !it.animated || (it.video && hasSound) }.forEach { m ->
                         FilterChip(selected = mode == m, onClick = { mode = m }, label = { Text(m.label) })
                     }
                 }
-                Text(description, style = MaterialTheme.typography.bodySmall)
+                Hint(description)
                 if (mode == ExportMode.Layers && hidden > 0) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.clickable { includeHidden = !includeHidden },
-                    ) {
-                        Checkbox(checked = includeHidden, onCheckedChange = { includeHidden = it })
-                        Text("Include hidden layers ($hidden)")
-                    }
+                    SwitchRow("Include hidden layers ($hidden)", includeHidden, { includeHidden = it })
                 }
                 if (mode.video) {
-                    Text("Size", style = MaterialTheme.typography.labelLarge)
+                    SectionLabel("Size")
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         VideoSize.entries.forEach { s ->
                             FilterChip(selected = videoSize == s, onClick = { videoSize = s }, label = { Text(s.label) })
                         }
                     }
-                    Text("Shape", style = MaterialTheme.typography.labelLarge)
+                    SectionLabel("Shape")
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         VideoShape.entries.forEach { s ->
                             FilterChip(selected = videoShape == s, onClick = { videoShape = s }, label = { Text(s.label) })
                         }
                     }
                     if (hasSound) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.clickable { vm.setLoopToAudio(!vm.loopToAudio) },
-                        ) {
-                            Checkbox(checked = vm.loopToAudio, onCheckedChange = { vm.setLoopToAudio(it) })
-                            Text("Loop the animation until the sound ends")
-                        }
+                        SwitchRow("Loop the animation until the sound ends", vm.loopToAudio, { vm.setLoopToAudio(it) })
                     }
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { pickBackground = true }) {
-                        Text("Background", style = MaterialTheme.typography.labelLarge)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        SectionLabel("Background")
                         Spacer(Modifier.width(12.dp))
-                        ColorSwatch(background, size = 32.dp)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Change", color = MaterialTheme.colorScheme.primary)
+                        ColorSwatch(background, size = 28.dp, label = "Background color")
+                        Spacer(Modifier.weight(1f))
+                        PgTextButton("Change", onClick = { pickBackground = true })
                     }
                     val p = preview
                     if (p == null) {
@@ -261,7 +254,7 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
                         Text(
                             "${layout.width} × ${layout.height} px  ·  ${Timing.formatMs(exporter.durationMs)}  ·  " +
                                 "up to ${if (mb < 1) "%.1f".format(mb) else "%.0f".format(mb)} MB",
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = Pg.Data,
                         )
                         Text(
                             "Pixels are scaled ${layout.scale}× and stay sharp. Long videos keep exporting " +
@@ -270,7 +263,7 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
                         )
                     }
                 } else {
-                    Text("Scale", style = MaterialTheme.typography.labelLarge)
+                    SectionLabel("Scale")
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Scales.forEach { s ->
                             FilterChip(selected = scale == s, onClick = { scale = s }, label = { Text("${s}×") })
@@ -282,7 +275,7 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
                             append("$outW × $outH px")
                             if (fileCount > 1) append(" each")
                         },
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = Pg.Data,
                     )
                 }
                 if (tooBig) {
@@ -296,7 +289,7 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
         },
         confirmButton = {
             val enabled = !busy && fileCount > 0 && !tooBig && (!mode.video || preview != null)
-            TextButton(enabled = enabled, onClick = {
+            PrimaryButton(if (mode.video) "Export video" else if (PngExporter.needsLegacyPermission) "Save" else "Save to Pictures", enabled = enabled, onClick = {
                 when {
                     PngExporter.needsLegacyPermission &&
                         ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED ->
@@ -306,14 +299,12 @@ fun ExportDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
                         notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                     else -> save()
                 }
-            }) { Text(if (mode.video) "Export video" else if (PngExporter.needsLegacyPermission) "Save" else "Save to Pictures") }
+            })
         },
         dismissButton = {
-            if (mode.video) {
-                TextButton(onClick = onDismiss) { Text("Cancel") }
-            } else {
-                TextButton(enabled = !busy && fileCount > 0 && !tooBig, onClick = ::share) { Text("Share") }
-            }
+            // Two buttons fit on one line: images can be shared instead; video asks to cancel.
+            if (mode.video) PgTextButton("Cancel", onClick = onDismiss, enabled = !busy)
+            else SecondaryButton("Share", onClick = ::share, enabled = !busy && fileCount > 0 && !tooBig)
         },
     )
 

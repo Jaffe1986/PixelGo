@@ -3,29 +3,31 @@ package com.pixelgo.ui.editor
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.pixelgo.model.MAX_FPS
 import com.pixelgo.model.MAX_HOLD
 import com.pixelgo.model.MIN_FPS
+import com.pixelgo.ui.common.Hint
+import com.pixelgo.ui.common.PgTextButton
+import com.pixelgo.ui.common.PrimaryButton
+import com.pixelgo.ui.common.SliderRow
+import com.pixelgo.ui.common.SwitchRow
+import com.pixelgo.ui.theme.Pg
 import kotlin.math.roundToInt
 
 /** How long a frame stays on screen, in ticks (1 tick = 1/fps second). */
@@ -59,69 +61,49 @@ fun HoldDialog(
                     }
                 }
                 if (value != null && valid) {
-                    Text("= ${value * 1000L / fps} ms", style = MaterialTheme.typography.bodyMedium)
+                    Text("= ${value * 1000L / fps} ms", style = Pg.Data, color = Pg.Text2)
                 }
             }
         },
         confirmButton = {
-            TextButton(enabled = valid, onClick = { if (value != null) onConfirm(value) }) { Text("OK") }
+            PrimaryButton("OK", onClick = { if (value != null) onConfirm(value) }, enabled = valid)
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = { PgTextButton("Cancel", onClick = onDismiss) },
     )
 }
 
+/** Speed, where duplicates go, and looping under a longer sound. (Onion skin is on the timeline.) */
 @Composable
 fun AnimationSettingsDialog(vm: EditorViewModel, onDismiss: () -> Unit) {
     var fps by remember { mutableFloatStateOf(vm.fps.toFloat()) }
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { vm.changeFps(fps.roundToInt()); onDismiss() },
         title = { Text("Animation") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Speed: ${fps.roundToInt()} frames per second", style = MaterialTheme.typography.bodyLarge)
-                Slider(
-                    value = fps,
-                    onValueChange = { fps = it },
-                    onValueChangeFinished = { vm.changeFps(fps.roundToInt()) },
-                    valueRange = MIN_FPS.toFloat()..MAX_FPS.toFloat(),
-                    steps = MAX_FPS - MIN_FPS - 1,
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column {
+                    SliderRow(
+                        "Speed", "${fps.roundToInt()} fps", fps,
+                        onValueChange = { fps = it.roundToInt().toFloat() },
+                        valueRange = MIN_FPS.toFloat()..MAX_FPS.toFloat(),
+                        onValueChangeFinished = { vm.changeFps(fps.roundToInt()) },
+                        step = 1f,
+                    )
+                    Hint("Each frame shows for ${(1000f / fps.roundToInt()).roundToInt()} ms. To hold one longer, use Hold.")
+                }
+                SwitchRow(
+                    "Duplicates go to the end", vm.duplicateToEnd, { vm.updateDuplicateToEnd(it) },
+                    detail = "The duplicate button adds the copy after the last frame instead of right after the current one.",
                 )
-                Text(
-                    "Each frame shows for ${(1000f / fps.roundToInt()).roundToInt()} ms. " +
-                        "Long-press a frame to hold it longer.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                SettingSwitch(
-                    "Duplicates go to the end",
-                    "The duplicate button adds the copy after the last frame instead of right after the current one.",
-                    vm.duplicateToEnd,
-                ) { vm.updateDuplicateToEnd(it) }
-                SettingSwitch(
-                    "Onion skin",
-                    "Show the previous frame (red) and next frame (blue) faintly while drawing.",
-                    vm.onionSkin,
-                ) { vm.toggleOnionSkin() }
-                SettingSwitch(
-                    "Loop animation until the sound ends",
-                    "When the sound is longer than the animation, keep repeating the animation " +
+                SwitchRow(
+                    "Loop the animation until the sound ends", vm.loopToAudio, { vm.setLoopToAudio(it) },
+                    detail = "When the sound is longer than the animation, keep repeating the animation " +
                         "(in playback and video export) instead of stopping.",
-                    vm.loopToAudio,
-                ) { vm.setLoopToAudio(it) }
+                )
             }
         },
         confirmButton = {
-            TextButton(onClick = { vm.changeFps(fps.roundToInt()); onDismiss() }) { Text("Done") }
+            PrimaryButton("Done", onClick = { vm.changeFps(fps.roundToInt()); onDismiss() })
         },
     )
-}
-
-@Composable
-private fun SettingSwitch(title: String, detail: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text(title)
-            Text(detail, style = MaterialTheme.typography.bodySmall)
-        }
-        Switch(checked = checked, onCheckedChange = onChange)
-    }
 }

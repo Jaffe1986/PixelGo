@@ -8,6 +8,9 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -180,6 +183,15 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
         private set
     var canRedo by mutableStateOf(false)
         private set
+
+    /** Bumped after every finished edit (things that summarize the drawing redraw on it). */
+    var editTick by mutableIntStateOf(0)
+        private set
+
+    /** Messages with an Undo button, after something was deleted (shown by the editor screen). */
+    val snackbar = SnackbarHostState()
+    private var undoOffer: Job? = null
+    private var offeredEdit: com.pixelgo.editor.Edit? = null
     var projectName by mutableStateOf("")
         private set
 
@@ -457,8 +469,10 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
 
     fun deleteFrames() {
         val (from, count) = target()
-        frameOp {
-            if (!it.deleteFrames(from, count)) toast("An animation needs at least one frame")
+        undoable({ if (count == 1) "Deleted frame ${from + 1}" else "Deleted $count frames" }) {
+            frameOp {
+                if (!it.deleteFrames(from, count)) toast("An animation needs at least one frame")
+            }
         }
         clearRange()
     }
@@ -660,6 +674,14 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
     fun frameDelaysCs(): IntArray {
         val p = project ?: return IntArray(0)
         return GifEncoder.delaysCs(IntArray(p.frames.size) { p.frames[it].hold }, p.fps)
+    }
+
+    /** Mirror drawing: left-right ([x]) and/or top-bottom ([y]). */
+    fun setMirror(x: Boolean, y: Boolean) {
+        mirrorX = x
+        mirrorY = y
+        engine?.mirrorX = x
+        engine?.mirrorY = y
     }
 
     fun toggleMirrorX() {
@@ -910,7 +932,10 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
 
     fun addLayer() = layerOp { it.addLayer() }
     fun duplicateLayer() = runBulk(engine?.let { commitFloating(); it.duplicateLayerJob() })
-    fun deleteLayer() = layerOp { it.deleteLayer() }
+    fun deleteLayer() {
+        val name = project?.activeLayer?.name ?: "layer"
+        undoable({ "Deleted layer \"$name\"" }) { layerOp { it.deleteLayer() } }
+    }
     fun mergeDown() = runBulk(engine?.let { commitFloating(); it.mergeDownJob() })
     fun moveLayer(from: Int, to: Int) = layerOp { it.moveLayer(from, to) }
     fun setLayerVisible(i: Int, v: Boolean) = layerOp { it.setLayerVisible(i, v) }
@@ -997,12 +1022,43 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
         scheduleAutosave()
         canUndo = engine?.history?.canUndo == true
         canRedo = engine?.history?.canRedo == true
+        editTick++
+        // An Undo offer only stands while its step is still the latest.
+        offeredEdit?.let { if (engine?.history?.lastEdit !== it) dropUndoOffer() }
         syncBitmap()
         syncFrames()
         if (structure) {
             updateOnion()
             structureTick++
         }
+    }
+
+    /**
+     * Runs [action]; if it added an undo step, says what happened with an Undo button (instead of
+     * asking "are you sure?" first: deleting frames, tracks, layers, clips and sound).
+     */
+    private inline fun undoable(message: () -> String, action: () -> Unit) {
+        val before = engine?.history?.lastEdit
+        action()
+        val after = engine?.history?.lastEdit
+        if (after != null && after !== before) offerUndo(message(), after)
+    }
+
+    private fun offerUndo(message: String, edit: com.pixelgo.editor.Edit) {
+        undoOffer?.cancel()
+        offeredEdit = edit
+        undoOffer = viewModelScope.launch {
+            // Long (10 s): time to decide. It goes away early if another edit happens.
+            val r = snackbar.showSnackbar(message, actionLabel = "Undo", duration = SnackbarDuration.Long)
+            if (offeredEdit === edit) offeredEdit = null
+            if (r == SnackbarResult.ActionPerformed && engine?.history?.lastEdit === edit) undo()
+        }
+    }
+
+    private fun dropUndoOffer() {
+        offeredEdit = null
+        undoOffer?.cancel()
+        undoOffer = null
     }
 
     /** Autosave a couple of seconds after the last edit, so a crash or forced close loses little. */
@@ -1395,7 +1451,10 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
     }
 
     fun changeClip(c: com.pixelgo.model.AudioClip) = audioOp { it.changeClip(c) }
-    fun deleteClip(id: Long) = audioOp { it.deleteClip(id); selectedClipId = null }
+    fun deleteClip(id: Long) {
+        val name = clips().firstOrNull { it.id == id }?.let { assetName(it.assetId) } ?: "clip"
+        undoable({ "Deleted \"$name\"" }) { audioOp { it.deleteClip(id); selectedClipId = null } }
+    }
     fun duplicateClip(id: Long) = audioOp { it.duplicateClip(id) }
     /** Splits the clip at the sound cursor (the current frame's start unless placed in sound mode). */
     fun splitClipAtCurrentFrame(id: Long) = audioOp {
@@ -1404,9 +1463,14 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
 
     fun addTrack() = audioOp { selectedTrackId = it.addTrack("Track ${tracks().size + 1}").id }
     fun changeTrack(t: com.pixelgo.model.SoundTrack) = audioOp { it.changeTrack(t) }
-    fun deleteTrack(id: Long) = audioOp {
-        it.deleteTrack(id)
-        if (selectedTrackId == id) selectedTrackId = null
+    fun deleteTrack(id: Long) {
+        val name = tracks().firstOrNull { it.id == id }?.name ?: "track"
+        undoable({ "Deleted track \"$name\"" }) {
+            audioOp {
+                it.deleteTrack(id)
+                if (selectedTrackId == id) selectedTrackId = null
+            }
+        }
     }
 
     fun setLoopToAudio(value: Boolean) {
@@ -1477,7 +1541,10 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
 
     /** Delete the selected section (leaving silence), or with [closeGap] pull later sound left. */
     fun deleteSelection(closeGap: Boolean) = selectionOp { e, s ->
-        if (!e.deleteSection(s.tracks, s.fromMs, s.toMs, closeGap) && !closeGap) toast("No sound in the selection")
+        val secs = "%.2f".format(java.util.Locale.US, (s.toMs - s.fromMs) / 1000.0)
+        undoable({ if (closeGap) "Removed $secs s and closed the gap" else "Deleted $secs s" }) {
+            if (!e.deleteSection(s.tracks, s.fromMs, s.toMs, closeGap) && !closeGap) toast("No sound in the selection")
+        }
     }
 
     /** Opens silence as long as the selection, at its start (later sound moves right). */

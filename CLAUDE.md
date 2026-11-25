@@ -22,6 +22,11 @@ adb logcat -d -s PixelGoTest     # measured timings
 adb uninstall com.pixelgo.test   # the TEST package only; never uninstall com.pixelgo
 ```
 
+UI checks without the phone: the `Medium_Phone` emulator runs headless with
+`emulator -avd Medium_Phone -no-window -no-audio -read-only -no-snapshot -gpu swangle_indirect`
+(`swiftshader_indirect` gives black screenshots). Turn off its error dialogs
+(`settings put global hide_error_dialogs 1`); PixelGo takes ~15 s to draw its first frame there.
+
 Needs `ANDROID_HOME` or `local.properties` (`sdk.dir=...`). `local.properties` is git-ignored.
 
 ## Rules
@@ -49,6 +54,13 @@ Needs `ANDROID_HOME` or `local.properties` (`sdk.dir=...`). `local.properties` i
   - Cut edges get `DECLICK_MS` fades. Processed effects make a **new asset**; never rewrite a `.pcm` that a clip or undo may still use.
   - Multi-step actions that finish in the background use `beginGroup` / `endGroup`, and `cancelGroup` on failure.
 - **Noise removal** (`editor/denoise/RnNoise.kt`) is a faithful port of RNNoise v0.1.1. `RnNoiseTest` must stay under −60 dB from the ffmpeg reference. If the weights change, regenerate `rnnoise.bin` and the test reference with the scripts in `tools/` (see their headers). Keep the BSD notice (`assets/RNNOISE-LICENSE.txt`).
+- **UI (docs/DESIGN.md):**
+  - Build screens from the `Pg` tokens (`ui/theme/Theme.kt`) and the components in `ui/common/Components.kt`; don't style Material components one by one or add color literals.
+  - Yellow (`Pg.Accent`) only marks the current item and the one primary action of a surface. Text buttons are neutral.
+  - Tappable things get 48dp hit areas; no text below 11sp (`Pg.Mark`).
+  - Undoable actions don't ask "are you sure?": wrap them in `EditorViewModel.undoable` so a snackbar offers Undo. Permanent ones confirm with `ConfirmDialog(destructive = true)`.
+  - Every long-press needs a visible equivalent.
+  - Check portrait and landscape.
 - Product decisions in the README were made by the owner. Ask before changing them.
 
 ## Testing on a real phone

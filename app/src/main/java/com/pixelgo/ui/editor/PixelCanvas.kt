@@ -24,6 +24,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import com.pixelgo.ui.common.drawCheckerboard
+import com.pixelgo.ui.theme.Pg
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.max
@@ -80,7 +81,7 @@ fun PixelCanvas(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 }
             }
     ) {
-        drawRect(Color(0xFF15151A))
+        drawRect(Pg.Canvas)
         val scale = vp.scale
         if (scale <= 0f) return@Canvas
         vm.renderTick // read so the canvas redraws when pixels change

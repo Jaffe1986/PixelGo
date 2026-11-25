@@ -66,6 +66,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import com.pixelgo.model.Layer
 import com.pixelgo.ui.common.ConfirmDialog
+import com.pixelgo.ui.common.Hint
+import com.pixelgo.ui.common.PgIconButton
+import com.pixelgo.ui.common.PgSheet
+import com.pixelgo.ui.theme.Pg
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DriveFileRenameOutline
+import androidx.compose.material.icons.outlined.LibraryAdd
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import com.pixelgo.ui.common.TextInputDialog
 import com.pixelgo.ui.common.drawCheckerboard
 import kotlin.math.min
@@ -88,31 +97,29 @@ fun LayersSheet(vm: EditorViewModel, onDismiss: () -> Unit) {
     val active = project.activeLayerIndex
 
     var renaming by remember { mutableStateOf(false) }
-    var confirmDelete by remember { mutableStateOf(false) }
     var confirmMerge by remember { mutableStateOf(false) }
     var dragId by remember { mutableLongStateOf(-1L) }
     var dragOffset by remember { mutableFloatStateOf(0f) }
     val rowPx = with(LocalDensity.current) { RowHeight.toPx() }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.navigationBarsPadding().padding(bottom = 12.dp)) {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("Layers", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                IconButton(onClick = vm::addLayer, enabled = engine.canAddLayer) { Icon(Icons.Filled.Add, "Add layer") }
-                IconButton(onClick = vm::duplicateLayer, enabled = engine.canAddLayer) { Icon(Icons.Filled.ContentCopy, "Duplicate layer") }
-                IconButton(onClick = { confirmMerge = true }, enabled = active > 0) { Icon(Icons.AutoMirrored.Filled.MergeType, "Merge down") }
-                IconButton(onClick = { renaming = true }) { Icon(Icons.Filled.DriveFileRenameOutline, "Rename layer") }
-                IconButton(onClick = { confirmDelete = true }, enabled = n > 1) { Icon(Icons.Filled.Delete, "Delete layer") }
-            }
-            Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "Top of the list is drawn on top. Drag ≡ to reorder.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
-                    modifier = Modifier.weight(1f),
-                )
-                IconButton(onClick = vm::undo, enabled = vm.canUndo) { Icon(Icons.AutoMirrored.Filled.Undo, "Undo") }
-                IconButton(onClick = vm::redo, enabled = vm.canRedo) { Icon(Icons.AutoMirrored.Filled.Redo, "Redo") }
+    PgSheet(
+        title = "Layers",
+        onDismiss = onDismiss,
+        scroll = false,
+        actions = {
+            PgIconButton(Icons.Filled.Add, "Add layer", vm::addLayer, enabled = engine.canAddLayer)
+            PgIconButton(Icons.Outlined.LibraryAdd, "Duplicate layer", vm::duplicateLayer, enabled = engine.canAddLayer)
+            PgIconButton(Icons.AutoMirrored.Filled.MergeType, "Merge down", { confirmMerge = true }, enabled = active > 0)
+            PgIconButton(Icons.Outlined.DriveFileRenameOutline, "Rename layer", { renaming = true })
+            // Deleting acts at once; Undo (here or in the snackbar) brings it back.
+            PgIconButton(Icons.Outlined.Delete, "Delete layer", vm::deleteLayer, enabled = n > 1, tint = Pg.Danger)
+        },
+    ) {
+        Column {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Hint("Top of the list is drawn on top. Drag the handle to reorder.", Modifier.weight(1f))
+                PgIconButton(Icons.AutoMirrored.Filled.Undo, "Undo", vm::undo, enabled = vm.canUndo)
+                PgIconButton(Icons.AutoMirrored.Filled.Redo, "Redo", vm::redo, enabled = vm.canRedo)
             }
             Column(Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState())) {
                 for (display in 0 until n) {
@@ -177,7 +184,7 @@ fun LayersSheet(vm: EditorViewModel, onDismiss: () -> Unit) {
             ConfirmDialog(
                 "Merge layers?",
                 "\"${upper.name}\" will be merged down into \"${lower.name}\" and become one layer. " +
-                    "You can undo this with ↶.",
+                    "You can undo this.",
                 "Merge",
                 onDismiss = { confirmMerge = false },
             ) {
@@ -186,15 +193,6 @@ fun LayersSheet(vm: EditorViewModel, onDismiss: () -> Unit) {
             }
         } else {
             confirmMerge = false
-        }
-    }
-    if (confirmDelete) {
-        ConfirmDialog(
-            "Delete layer?", "\"${project.activeLayer?.name}\" will be removed (you can undo this).", "Delete",
-            onDismiss = { confirmDelete = false },
-        ) {
-            confirmDelete = false
-            vm.deleteLayer()
         }
     }
 }
@@ -219,12 +217,9 @@ private fun LayerRow(
         modifier
             .fillMaxWidth()
             .height(RowHeight)
-            .padding(horizontal = 8.dp, vertical = 2.dp)
+            .padding(vertical = 2.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(
-                if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
-                else MaterialTheme.colorScheme.surfaceContainer
-            )
+            .background(if (selected) Pg.AccentWeak else Pg.Surface3)
             .clickable(onClick = onSelect)
             .padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -251,21 +246,14 @@ private fun LayerRow(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
-            color = if (layer.visible) Color.Unspecified else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+            color = if (layer.visible) Pg.Text1 else Pg.Text3,
         )
-        IconButton(onClick = onToggleVisible) {
-            Icon(
-                if (layer.visible) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
-                if (layer.visible) "Hide layer" else "Show layer",
-            )
-        }
-        Column(verticalArrangement = Arrangement.Center) {
-            IconButton(onClick = onMoveUp, enabled = canMoveUp, modifier = Modifier.size(28.dp)) {
-                Icon(Icons.Filled.KeyboardArrowUp, "Move up")
-            }
-            IconButton(onClick = onMoveDown, enabled = canMoveDown, modifier = Modifier.size(28.dp)) {
-                Icon(Icons.Filled.KeyboardArrowDown, "Move down")
-            }
-        }
+        PgIconButton(
+            if (layer.visible) Icons.Outlined.Visibility else Icons.Outlined.VisibilityOff,
+            if (layer.visible) "Hide layer" else "Show layer",
+            onToggleVisible,
+        )
+        PgIconButton(Icons.Filled.KeyboardArrowUp, "Move up", onMoveUp, enabled = canMoveUp)
+        PgIconButton(Icons.Filled.KeyboardArrowDown, "Move down", onMoveDown, enabled = canMoveDown)
     }
 }

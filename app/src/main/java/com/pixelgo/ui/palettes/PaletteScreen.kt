@@ -33,7 +33,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -51,6 +50,9 @@ import com.pixelgo.model.Palette
 import com.pixelgo.ui.common.ColorPickerDialog
 import com.pixelgo.ui.common.ColorSwatch
 import com.pixelgo.ui.common.ConfirmDialog
+import com.pixelgo.ui.common.PgTextButton
+import com.pixelgo.ui.common.SecondaryButton
+import com.pixelgo.ui.theme.Pg
 import com.pixelgo.ui.common.TextInputDialog
 
 /** What the color picker is currently editing. index == null means "add new color". */
@@ -114,7 +116,7 @@ fun PaletteScreen(onBack: () -> Unit) {
         }
     }
     deleting?.let { p ->
-        ConfirmDialog("Delete palette?", "\"${p.name}\" will be permanently deleted.", "Delete", onDismiss = { deleting = null }) {
+        ConfirmDialog("Delete palette?", "\"${p.name}\" will be permanently deleted.", "Delete", onDismiss = { deleting = null }, destructive = true) {
             deleting = null
             repo.delete(p.id)
         }
@@ -154,6 +156,7 @@ private fun PaletteCard(
     val border = if (active) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null
     OutlinedCard(
         border = border ?: CardDefaults.outlinedCardBorder(),
+        colors = CardDefaults.outlinedCardColors(containerColor = Pg.Surface2),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(12.dp)) {
@@ -162,10 +165,10 @@ private fun PaletteCard(
                     Text(p.name, style = MaterialTheme.typography.titleMedium)
                     Text(
                         "${p.colors.size} colors" + if (active) " · in use" else "",
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MaterialTheme.typography.bodySmall, color = Pg.Text2,
                     )
                 }
-                if (!active) TextButton(onClick = onUse) { Text("Use") }
+                if (!active) SecondaryButton("Use", onClick = onUse)
                 Box {
                     IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "Palette options") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
@@ -226,6 +229,6 @@ private fun ColorOptionsDialog(
                 AssistChip(onClick = { repo.removeColor(p.id, index); onDismiss() }, label = { Text("Delete") })
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        confirmButton = { PgTextButton("Close", onClick = onDismiss) },
     )
 }

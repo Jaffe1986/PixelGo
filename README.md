@@ -13,18 +13,18 @@ Exports go to the phone's `Pictures/PixelGo` folder (images, GIFs) or `Movies/Pi
 
 | Area | What it does |
 |---|---|
-| **Canvas** | Any size from 1×1 to 256×256. Pinch to zoom, two-finger pan, pixel grid toggle, optional vertical/horizontal center guide lines, "Fit to screen". |
+| **Canvas** | Any size from 1×1 to 256×256. Pinch to zoom, two-finger pan, pixel grid toggle, optional vertical/horizontal center guide lines, "Fit to screen". Works upright or sideways: sideways, the tools and colors move to rails beside the canvas. |
 | **Drawing** | Pencil, eraser, flood fill, eyedropper. One pixel = one color (no brushes, by design). Strokes are interpolated so fast swipes leave no gaps. |
 | **Symmetry** | Mirror left↔right and/or top↕bottom (applies to pencil, eraser and fill). Mirror axes are shown as dashed pink lines. |
 | **Transparency** | Full alpha everywhere. A checkerboard shows transparent areas. Colors can be partly transparent (alpha slider / `#AARRGGBB` hex). |
 | **Layers** | Add, duplicate, delete, rename, show/hide, reorder (drag the ≡ handle or use the arrows), merge down (asks for confirmation). Layer operations apply to every frame. |
 | **Select** | Box or paint-brush selection. Copy, cut, move, paste, delete, select all/none. Moved/pasted cells float above the canvas: drag them, then ✓ to drop or ✕ to cancel. The clipboard works across projects until the app closes. |
 | **Animation** | **No frame limit:** frames are stored on the phone's storage, not in memory. Frames share the same layers. Speed is 1–60 fps, and each frame can be held for 1–999 ticks. Onion skin shows the previous frame in red and the next in blue. Playback is driven by the sound clock, so picture and sound stay in sync. |
-| **Timeline** | **Compact strip**, or **tap ▲ for the full editor**, which has: a zoomable time ruler (pinch to zoom, flick to scroll, drag the ruler to scrub), frames drawn as wide as they are held, and thumbnails. **Long-press a frame** to insert blank before/after, duplicate after/to end, copy/paste, set the hold, move or delete. **Range mode** lets you select a run of frames and copy, cut, paste (before/after/at end), duplicate, reverse, set the hold, move, or delete them. **Frames can be copied between projects** (missing layers are added, and other canvas sizes are centered). A setting makes **duplicate always add to the end**. |
+| **Timeline** | **Compact strip** (with play, onion skin, add and duplicate), or **drag the handle up (or tap it)** for the full editor, which has: a zoomable time ruler (pinch to zoom, flick to scroll, drag the ruler to scrub), frames drawn as wide as they are held, and thumbnails. **Long-press a frame** to insert blank before/after, duplicate after/to end, copy/paste, set the hold, move or delete. **Range mode** lets you select a run of frames and copy, cut, paste (before/after/at end), duplicate, reverse, set the hold, move, or delete them. **Frames can be copied between projects** (missing layers are added, and other canvas sizes are centered). A setting makes **duplicate always add to the end**. |
 | **Sound** | **Tracks of clips** (music, voice, effects…). **Import** any sound the phone can decode (MP3, AAC/M4A, WAV, OGG, FLAC, Opus, or the audio of a video). **Record** with the microphone, either as a **voice-over** (the animation plays while you record) or **"record here"** at the current frame. The 3-2-1 count-in plays three ticks that the microphone hears, which lines the recording up with the picture to within a millisecond. Clips show their waveform. **Tap** a clip for volume (up to 400%, or **Normalize**), fades, nudge, split, effects, noise cleanup, duplicate or delete. **Long-press and drag** to move it (it snaps to frames and can go to another track); drag its edges to trim. Tracks can be muted, renamed, set in volume, or deleted. **"Loop animation until the sound ends"** repeats a short animation under a long song. |
 | **Sound editing** | **Sound mode** (the waveform button in the full timeline) gives the sound tracks the whole screen, with the current frame shown small at the top. **Zoom** in time down to single samples. **Pinch up/down** for taller tracks and pick a **waveform size** (×1–×16) so quiet sound is easy to see. With the **Select** tool, drag across one or more tracks to pick any section, then: **cut, copy, paste, delete** (leaves a gap), **close gap**, **split**, **duplicate**, **insert silence**, **fade in/out**, or set its **volume**. **Copy and paste work between projects.** **Fades:** drag the handles at a clip's top corners. **Volume line:** with the Volume tool, tap to add a point, drag to move it, long-press to remove it. Clips that overlap on a track **crossfade** automatically. **Effects:** reverse, speed, pitch, tape-style speed, low cut, bass/mid/treble, and a noise gate. **Clean up noise (AI)** removes background noise with a neural network that runs on the phone (RNNoise), with a strength slider and **Before/After** buttons to compare. **Re-record a section** (punch-in) plays 2 s before the section, records, stops on its own, and puts the new take exactly where the old one was. Every edit is one undo step. |
 | **Palettes** | Built-in "Default" palette plus unlimited custom palettes: create, rename, duplicate, delete, add/edit/reorder/remove colors. Color picker with HSV square, hue bar, alpha bar, hex entry and recent colors. |
-| **Undo / redo** | Every edit (pixels, layers, frames, holds, ranges, pastes, sound clips and tracks) is undoable, up to 100 steps per editing session. |
+| **Undo / redo** | Every edit (pixels, layers, frames, holds, ranges, pastes, sound clips and tracks) is undoable, up to 100 steps per editing session. Deleting frames, layers, tracks, clips or sound happens at once and shows "Deleted … · Undo" instead of asking first. |
 | **Saving** | Autosaves 2 s after the last edit, when leaving the editor, and when the app goes to the background. Only what changed is written, so long animations save instantly. |
 | **Export** | **Images:** transparent PNG at 1×–16× (nearest-neighbour, stays crisp), each layer, animated GIF, sprite sheet, each frame. **Video:** **MP4** or **MOV** (H.264 + AAC sound) at 480p / 720p / 1080p / 4K, with the canvas shape or 16:9 / 9:16 / 1:1 and a background color of your choice. Pixels are scaled by even whole numbers so edges stay sharp. Long exports run in the background with a progress notification and a Cancel button. |
 
@@ -118,6 +118,8 @@ app/src/main/java/com/pixelgo/
 ├── export/                    ExportJobs (one background export at a time) + ExportService (foreground service)
 └── ui/
     ├── gallery/               Project grid, new-project dialog
+    ├── theme/Theme.kt         Design tokens (Pg: colors, type, sizes) and the Material theme (docs/DESIGN.md)
+    ├── common/Components.kt   Shared components: buttons, tool and dock buttons, action bars, sheets, sliders…
     ├── editor/                EditorScreen, PixelCanvas, EditorViewModel, TimelineView (+dialogs),
     │                          AudioSheets (record / clip options), PreviewPlayer (sound + playback clock),
     │                          SoundModeBars + EffectsSheet (sound mode), WaveformCache (zoomed-in waveforms),
@@ -125,7 +127,7 @@ app/src/main/java/com/pixelgo/
     ├── palettes/ common/ theme/
 app/src/main/assets/           rnnoise.bin (the noise-removal network's weights) + RNNOISE-LICENSE.txt
 app/src/test/java/com/pixelgo/ EngineTest, AnimationTest, StorageTest, RangeTest, VideoTest, AudioTest,
-                               SoundEditTest, EffectsTest, RnNoiseTest (113 tests) + reference sounds in resources/
+                               SoundEditTest, EffectsTest, RnNoiseTest (114 tests) + reference sounds in resources/
 app/src/androidTest/           MediaDeviceTest (12 on-device tests) + test sounds in assets/
 tools/                         rnnoise_weights.py (makes rnnoise.bin), rnnoise_reference.py (RnNoiseTest's reference)
 docs/ARCHITECTURE.md           How it fits together, file formats, gotchas. Read this before changing code.
@@ -156,13 +158,14 @@ These were chosen deliberately by the project owner. Keep them unless the owner 
 - **Sound:** several tracks of clips (move, trim, volume), import from files, record with the mic as a voice-over or at a frame. Sound is positioned in **milliseconds**, so changing fps never shifts it. An option loops a short animation to fill a long sound.
 - **Sound editing:** a **full-screen sound mode** of the timeline. Deleting a section **leaves a gap**; "Close gap" is a separate action. Volume, fades, the volume line and crossfades don't change the sound files. Effects and noise cleanup make a new sound file, and the clip switches to it (undo switches back).
 - **AI noise removal is built in** (RNNoise, about 90 KB, works offline). Phone makers' AI audio erasers can't be used by other apps.
+- **Design ("Light table", docs/DESIGN.md):** a graphite workspace where the art is the brightest thing on screen. **Yellow stays PixelGo's color** but only marks the current item (tool, frame, swatch, selection) and the one main action. **Undoable deletes don't ask**: they offer Undo. Merging layers still asks, and so does deleting a project or palette (those can't be undone).
 - **Export formats:** single PNG, PNG per layer, animated GIF, sprite sheet PNG, PNG per frame, **MP4** and **MOV** video with sound.
 
 ---
 
 ## Status
 
-Everything above is implemented and covered by 113 JVM unit tests: engine, undo/redo, storage and
+Everything above is implemented and covered by 114 JVM unit tests: engine, undo/redo, storage and
 migration, frame ranges and the clipboard, timing, GIF (decoded back with `javax.imageio`), video
 layout / color conversion / MOV patching, resampling, mixing, and sound files. For sound editing
 they cover:
@@ -198,6 +201,20 @@ they cover:
 - **Effects:** +12 semitones moved a 1 kHz tone to 2 kHz, with timing within 8 ms.
 - **Copy and paste;** punch-in with auto-stop.
 - **Noise cleanup:** the Clean up noise (AI) sheet and its Before/After preview.
+
+**Redesign (phases 1 and 2 of docs/DESIGN.md)**, checked on the Android emulator (1080 × 2400), upright and sideways:
+- **Gallery and editor:** the new top bar, tool dock, color row, rails and timeline header.
+- **Frames:** range bar, More menu, Delete with Undo from the snackbar.
+- **Tools:** the Mirror control.
+- **Sheets:** layers, clip, effects and noise cleanup.
+- **Sound mode:** its selection bar and grouped More menu.
+- **Dialogs:** export and animation settings.
+
+Then on the phone (portrait), in a test project:
+- **Frames:** Delete, and Undo from the snackbar.
+- **Mirror and Layers:** the Mirror control and the layers sheet.
+- **Sound mode:** its header and playhead.
+- **Permanent delete:** the red confirm button, deleting the test project.
 
 **Not yet tried:**
 - headphones and Bluetooth (see below)
@@ -243,4 +260,5 @@ they cover:
 ## More documentation
 
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**: data model, storage and saving, editing engine, undo, timeline, sound, video export, file formats, and Compose pitfalls specific to this codebase.
+- **[docs/DESIGN.md](docs/DESIGN.md)**: the design system: tokens, components, interaction rules, and what's still to do.
 - **[CLAUDE.md](CLAUDE.md)**: short working notes for AI-assisted development (also useful for humans).

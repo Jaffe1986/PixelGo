@@ -166,6 +166,8 @@ back on undo, so no pixel copies are kept, even across thousands of frames.
   - Needs a selection on one track. It records like a voice-over from `PUNCH_PREROLL_MS` (2 s) before the section, and stops itself 1 s after the section ends.
   - On stop, the take is lined up exactly like a voice-over (count-in). Only the section's part is `placeOver`ed, with 10 ms fades.
 - **Autosave:** 2 s after the last edit, and on `ON_STOP` and back. Postponed while busy.
+- **Undo offers:** `undoable(message) { … }` runs a delete and, if it added an undo step, shows "Deleted … · Undo" in `snackbar` (shown by `EditorScreen`). Undo only acts while that step is still `History.lastEdit`; any later edit withdraws the offer.
+- **Look and layout:** screens use the tokens in `ui/theme/Theme.kt` and the components in `ui/common/Components.kt` (see [DESIGN.md](DESIGN.md)). `EditorScreen` switches to rails beside the canvas when the screen is wider than tall.
 
 ---
 
@@ -173,6 +175,7 @@ back on undo, so no pixel copies are kept, even across thousands of frames.
 
 It's one `Canvas` that draws **only what's visible**: the frames between `frameAtTick(scroll)` and `frameAtTick(scroll + width)`, and the clips inside the visible time range.
 
+- **Header and handle:** compact shows play, the filmstrip, onion skin, add and duplicate; full shows play and time, onion skin, select frames, add, duplicate and sound mode. The handle on top switches between them (tap, or drag up / down). Record and import live in sound mode and the track menu.
 - **Size:** a frame's width = `hold × zoom` (zoom = screen pixels per tick). Thumbnails are 64 px composites cached in the view model, keyed by `(frameUid, frameVersion, layersVersion)`, and rendered on `Dispatchers.Default`.
 - **Gestures** (one `awaitEachGesture`):
 

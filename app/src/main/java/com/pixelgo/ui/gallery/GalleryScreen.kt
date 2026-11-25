@@ -34,7 +34,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material.icons.filled.MoreVert
+import com.pixelgo.ui.common.PgIconButton
+import com.pixelgo.ui.common.PgTextButton
+import com.pixelgo.ui.common.PrimaryButton
+import com.pixelgo.ui.theme.Pg
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -110,14 +115,14 @@ fun GalleryScreen(onOpen: (String) -> Unit, onPalettes: () -> Unit) {
             ExtendedFloatingActionButton(
                 onClick = { showNew = true },
                 icon = { Icon(Icons.Filled.Add, null) },
-                text = { Text("New") },
+                text = { Text("New project") },
             )
         },
     ) { padding ->
         val list = projects
         if (list != null && list.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                Text("No projects yet.\nTap New to start drawing.", style = MaterialTheme.typography.bodyLarge)
+                Text("No projects yet.\nTap New project to start drawing.", style = MaterialTheme.typography.bodyLarge)
             }
         } else if (list != null) {
             LazyVerticalGrid(
@@ -161,7 +166,7 @@ fun GalleryScreen(onOpen: (String) -> Unit, onPalettes: () -> Unit) {
     deleting?.let { p ->
         ConfirmDialog(
             "Delete project?", "\"${p.name}\" will be permanently deleted.", "Delete",
-            onDismiss = { deleting = null },
+            onDismiss = { deleting = null }, destructive = true,
         ) {
             deleting = null
             runThenRefresh { repo.delete(p.id) }
@@ -184,7 +189,10 @@ private fun ProjectCard(
             BitmapFactory.decodeFile(p.thumbnail.absolutePath)?.asImageBitmap()
         }
     }
-    Card(Modifier.combinedClickable(onClick = onClick, onLongClick = { menu = true })) {
+    Card(
+        Modifier.combinedClickable(onClickLabel = "Open", onLongClickLabel = "Project options", onClick = onClick, onLongClick = { menu = true }),
+        colors = CardDefaults.cardColors(containerColor = Pg.Surface2),
+    ) {
         Box(Modifier.fillMaxWidth().aspectRatio(1f).padding(8.dp)) {
             Canvas(Modifier.fillMaxSize()) {
                 val s = min(size.width / p.width, size.height / p.height)
@@ -201,28 +209,35 @@ private fun ProjectCard(
                     )
                 }
             }
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                // Not while a video of this project is being exported (it reads the project's files).
-                val free = !ExportJobs.isExporting(p.id)
-                DropdownMenuItem(text = { Text("Rename") }, enabled = free, onClick = { menu = false; onRename() })
-                DropdownMenuItem(text = { Text("Duplicate") }, enabled = free, onClick = { menu = false; onDuplicate() })
-                DropdownMenuItem(text = { Text("Delete") }, enabled = free, onClick = { menu = false; onDelete() })
-            }
         }
-        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-            Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
-            ExportJobs.state?.takeIf { it.projectId == p.id && !it.done }?.let {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(start = 12.dp, top = 8.dp, bottom = 10.dp)) {
+                Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
+                ExportJobs.state?.takeIf { it.projectId == p.id && !it.done }?.let {
+                    Text(
+                        "Exporting video… ${(it.progress * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
                 Text(
-                    "Exporting video… ${(it.progress * 100).toInt()}%",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
+                    "${p.width} × ${p.height}" +
+                        if (p.frameCount > 1) "  ·  ${p.frameCount} frames  ·  ${"%.1f".format(java.util.Locale.US, p.durationMs / 1000.0)} s" else "",
+                    style = MaterialTheme.typography.bodySmall, color = Pg.Text2,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
             }
-            Text(
-                "${p.width} × ${p.height}" +
-                    if (p.frameCount > 1) "  ·  ${p.frameCount} frames  ·  ${"%.1f".format(p.durationMs / 1000.0)} s" else "",
-                style = MaterialTheme.typography.bodySmall,
-            )
+            // The same options as long-press, visible.
+            Box {
+                PgIconButton(Icons.Filled.MoreVert, "Options for ${p.name}", { menu = true }, iconSize = 20.dp)
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    // Not while a video of this project is being exported (it reads the project's files).
+                    val free = !ExportJobs.isExporting(p.id)
+                    DropdownMenuItem(text = { Text("Rename") }, enabled = free, onClick = { menu = false; onRename() })
+                    DropdownMenuItem(text = { Text("Duplicate") }, enabled = free, onClick = { menu = false; onDuplicate() })
+                    DropdownMenuItem(text = { Text("Delete", color = Pg.Danger) }, enabled = free, onClick = { menu = false; onDelete() })
+                }
+            }
         }
     }
 }
@@ -271,8 +286,8 @@ private fun NewProjectDialog(onDismiss: () -> Unit, onCreate: (String, Int, Int)
             }
         },
         confirmButton = {
-            TextButton(enabled = valid, onClick = { onCreate(name.trim(), wi!!, hi!!) }) { Text("Create") }
+            PrimaryButton("Create", onClick = { onCreate(name.trim(), wi!!, hi!!) }, enabled = valid)
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        dismissButton = { PgTextButton("Cancel", onClick = onDismiss) },
     )
 }

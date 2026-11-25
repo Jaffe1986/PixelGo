@@ -33,6 +33,21 @@ class EngineTest {
 
     private fun engine(w: Int = 8, h: Int = 8) = testEngine(w, h)
 
+    /** The editor's "Deleted … · Undo" offer only undoes while its step is still the latest. */
+    @Test fun lastEditIsTheStepUndoWouldTakeBack() {
+        val e = engine()
+        assertEquals(null, e.history.lastEdit)
+        e.dot(1, 1, red)
+        val first = e.history.lastEdit
+        e.dot(2, 2, blue)
+        val second = e.history.lastEdit
+        assertTrue(first != null && second != null && first !== second)
+        e.undo()
+        assertTrue(e.history.lastEdit === first)
+        e.redo()
+        assertTrue(e.history.lastEdit === second)
+    }
+
     @Test fun mirrorPointsEvenWidth() {
         val pts = mutableListOf<Pair<Int, Int>>()
         Raster.forEachMirrored(1, 2, 8, 8, mirrorX = true, mirrorY = true) { x, y -> pts += x to y }

@@ -340,6 +340,9 @@ class History(private val limit: Int = 100) {
     val canUndo get() = undoStack.isNotEmpty()
     val canRedo get() = redoStack.isNotEmpty()
 
+    /** The step Undo would take back now (lets an "Undo" offer check it's still the latest). */
+    val lastEdit: Edit? get() = undoStack.lastOrNull()
+
     /** Edits collected since [beginGroup], recorded as one step by [endGroup]. */
     private var group: MutableList<Edit>? = null
 

@@ -12,7 +12,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -25,40 +25,30 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.outlined.LibraryAdd
+import androidx.compose.material.icons.outlined.ViewWeek
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.ExpandLess
-import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.LibraryAdd
-import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Timer
-import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.ViewWeek
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -75,10 +65,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
@@ -96,6 +86,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -110,8 +105,18 @@ import com.pixelgo.model.FRAMES_PER_MS
 import com.pixelgo.model.Frame
 import com.pixelgo.model.GainPoint
 import com.pixelgo.model.SoundTrack
-import com.pixelgo.ui.common.ConfirmDialog
+import com.pixelgo.ui.common.ActionBar
+import com.pixelgo.ui.common.BarAction
+import com.pixelgo.ui.common.Choice
+import com.pixelgo.ui.common.OnionSkinIcon
+import com.pixelgo.ui.common.PgIconButton
+import com.pixelgo.ui.common.PgTextButton
+import com.pixelgo.ui.common.PrimaryButton
+import com.pixelgo.ui.common.RoundIconButton
+import com.pixelgo.ui.common.SliderRow
 import com.pixelgo.ui.common.TextInputDialog
+import com.pixelgo.ui.common.drawCheckerboard
+import com.pixelgo.ui.theme.Pg
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -121,20 +126,18 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-private val RangeTint = Color(0x553DD6A0)
-private val TrackColors = listOf(Color(0xFF3D8BFF), Color(0xFFFF8A3D), Color(0xFFB45CFF), Color(0xFF2EC4B6), Color(0xFFFF5C8A))
-
-private const val RULER_DP = 22
+private const val RULER_DP = 24
 private const val FRAMES_DP = 64
 private const val ROW_DP = 40
-private const val ADD_ROW_DP = 28
+private const val ADD_ROW_DP = 36
 private const val MAX_VISIBLE_ROWS = 3
 
 /**
  * The animation timeline. Each frame's width is proportional to how long it's held.
  *
- * - Compact: one row of frames with play / add / duplicate / expand.
+ * - Compact: one row of frames with play, onion skin, add and duplicate.
  * - Expanded: a toolbar, a time ruler (drag it to scrub), the frames, and the sound tracks.
+ * - The handle on top switches between them (tap, or drag up / down).
  * - Frames: tap = select (or pick a range in range mode), long-press = frame menu.
  * - Sound: tap a clip = its options, tap a track name = track menu, long-press a clip and
  *   drag = move it (edges: trim), drag up/down = scroll the tracks.
@@ -157,17 +160,14 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
     var effectsFor by remember { mutableStateOf<Long?>(null) } // a clip id, or SELECTION
     var cleanupFor by remember { mutableStateOf<Long?>(null) } // a clip id, or SELECTION
     var showPunch by remember { mutableStateOf(false) }
-    var showSettings by remember { mutableStateOf(false) }
     var showRecord by remember { mutableStateOf(false) }
     var holdTarget by remember { mutableIntStateOf(-2) } // -2 none, -1 range/current, >=0 frame
-    var confirmDelete by remember { mutableStateOf(false) }
     var menuFrame by remember { mutableIntStateOf(-1) }
     var menuX by remember { mutableFloatStateOf(0f) }
     var trackMenu by remember { mutableLongStateOf(-1L) }
     var trackMenuY by remember { mutableFloatStateOf(0f) }
     var renameTrack by remember { mutableLongStateOf(-1L) }
     var volumeTrack by remember { mutableLongStateOf(-1L) }
-    var deleteTrack by remember { mutableLongStateOf(-1L) }
     val thumbs = remember { mutableStateMapOf<Long, ImageBitmap>() }
     val textMeasurer = rememberTextMeasurer()
     val scope = rememberCoroutineScope()
@@ -609,11 +609,11 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 }
         ) {
             val colors = TimelineColors(
-                background = MaterialTheme.colorScheme.surfaceContainerLow,
-                cell = Color(0x26FFFFFF),
-                primary = MaterialTheme.colorScheme.primary,
-                ruler = MaterialTheme.colorScheme.surfaceContainerHigh,
-                text = MaterialTheme.colorScheme.onSurface,
+                background = Pg.Background,
+                cell = Pg.Surface3,
+                primary = Pg.Accent,
+                ruler = Pg.Surface1,
+                text = Pg.Text2,
             )
             Canvas(Modifier.fillMaxSize()) {
                 vm.renderTick // redraw when the live frame changes
@@ -637,7 +637,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     index = menuFrame,
                     onDismiss = { menuFrame = -1 },
                     onHold = { holdTarget = it },
-                    onDelete = { vm.selectFrame(it); confirmDelete = true },
+                    onDelete = { vm.selectFrame(it); vm.deleteFrames() },
                 )
             }
             // Menu for a sound track.
@@ -664,7 +664,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                             importLauncher.launch(arrayOf("audio/*", "video/*"))
                         })
                         HorizontalDivider()
-                        DropdownMenuItem(text = { Text("Delete track") }, onClick = { trackMenu = -1L; deleteTrack = t.id })
+                        DropdownMenuItem(text = { Text("Delete track", color = Pg.Danger) }, onClick = { trackMenu = -1L; vm.deleteTrack(t.id) })
                     }
                 }
             }
@@ -677,7 +677,6 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 vm,
                 onRecord = { showRecord = true },
                 onImport = { importLauncher.launch(arrayOf("audio/*", "video/*")) },
-                onSettings = { showSettings = true },
                 canPaste = vm.canPasteSound,
             )
             SoundToolsRow(vm, onZoom = { factor ->
@@ -694,53 +693,42 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                     onReRecord = { showPunch = true }, canPaste = vm.canPasteSound,
                 )
             }
-            if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 }, onDelete = { confirmDelete = true })
+            if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 })
             track(Modifier.fillMaxWidth().weight(1f))
         } else if (expanded) {
+            TimelineHandle(expanded = true) { expandedSetting = it }
             Row(
-                Modifier.fillMaxWidth().height(44.dp).padding(horizontal = 2.dp),
+                Modifier.fillMaxWidth().height(Pg.BarHeight).padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 PlayButton(vm)
                 val ms = if (vm.isPlaying) Timing.ticksToMs(vm.playTick, fps)
                 else Timing.ticksToMs(timing.startTick(follow.coerceIn(0, timing.frameCount - 1)), fps)
-                Column(Modifier.weight(1f).padding(start = 2.dp)) {
-                    Text(Timing.formatMs(ms), style = MaterialTheme.typography.labelMedium, maxLines = 1)
-                    Text("${follow + 1} / ${vm.frameCount}", style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                Column(Modifier.weight(1f).padding(start = 6.dp)) {
+                    Text(Timing.formatMs(ms), style = Pg.Data, maxLines = 1)
+                    Text("${follow + 1} / ${vm.frameCount}", style = Pg.Mark, color = Pg.Text2, maxLines = 1)
                 }
-                val s = 36.dp
-                SmallIconButton(Icons.Filled.ViewWeek, "Select frames", selected = vm.rangeMode, size = s, onClick = vm::toggleRangeMode)
-                SmallIconButton(Icons.Filled.Add, "Add blank frame", size = s, onClick = { vm.addFrame(FramePosition.AFTER) })
-                SmallIconButton(
-                    Icons.Filled.LibraryAdd,
-                    if (vm.duplicateToEnd) "Duplicate frame to end" else "Duplicate frame",
-                    size = s,
-                    onClick = { vm.duplicateFrame() },
-                )
-                SmallIconButton(Icons.Filled.Mic, "Record sound", size = s, onClick = { showRecord = true })
-                SmallIconButton(Icons.Filled.MusicNote, "Import sound", size = s, onClick = { importLauncher.launch(arrayOf("audio/*", "video/*")) })
-                SmallIconButton(Icons.Filled.GraphicEq, "Sound mode (full screen)", size = s, onClick = { vm.enterSoundMode(true) })
-                SmallIconButton(Icons.Filled.Tune, "Animation settings", size = s, onClick = { showSettings = true })
-                SmallIconButton(Icons.Filled.ExpandMore, "Smaller timeline", size = s, onClick = { expandedSetting = false })
+                OnionToggle(vm)
+                PgIconButton(Icons.Outlined.ViewWeek, "Select frames", vm::toggleRangeMode, checked = vm.rangeMode)
+                PgIconButton(Icons.Filled.Add, "Add blank frame", { vm.addFrame(FramePosition.AFTER) })
+                PgIconButton(Icons.Outlined.LibraryAdd, duplicateLabel(vm), { vm.duplicateFrame() })
+                PgIconButton(Icons.Filled.GraphicEq, "Sound mode", { vm.enterSoundMode(true) })
             }
-            if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 }, onDelete = { confirmDelete = true })
+            if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 })
             val audioDp = visibleRows * ROW_DP + ADD_ROW_DP
             track(Modifier.fillMaxWidth().height((RULER_DP + FRAMES_DP + audioDp + 4).dp))
         } else {
-            if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 }, onDelete = { confirmDelete = true })
+            if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 })
+            TimelineHandle(expanded = false) { expandedSetting = it }
             Row(
-                Modifier.fillMaxWidth().height(60.dp).padding(horizontal = 4.dp),
+                Modifier.fillMaxWidth().height(56.dp).padding(start = 4.dp, end = 4.dp, bottom = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 PlayButton(vm)
-                track(Modifier.weight(1f).height(56.dp).clip(RoundedCornerShape(8.dp)))
-                SmallIconButton(Icons.Filled.Add, "Add blank frame", onClick = { vm.addFrame(FramePosition.AFTER) })
-                SmallIconButton(
-                    Icons.Filled.LibraryAdd,
-                    if (vm.duplicateToEnd) "Duplicate frame to end" else "Duplicate frame",
-                    onClick = { vm.duplicateFrame() },
-                )
-                SmallIconButton(Icons.Filled.ExpandLess, "Bigger timeline (with sound)", onClick = { expandedSetting = true })
+                track(Modifier.weight(1f).height(52.dp).clip(RoundedCornerShape(6.dp)))
+                OnionToggle(vm)
+                PgIconButton(Icons.Filled.Add, "Add blank frame", { vm.addFrame(FramePosition.AFTER) })
+                PgIconButton(Icons.Outlined.LibraryAdd, duplicateLabel(vm), { vm.duplicateFrame() })
             }
         }
     }
@@ -752,7 +740,6 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
         }
     }
 
-    if (showSettings) AnimationSettingsDialog(vm, onDismiss = { showSettings = false })
     if (showRecord) RecordSheet(vm, onDismiss = { showRecord = false })
     if (showPunch) RecordSheet(vm, onDismiss = { showPunch = false }, punchIn = true)
     effectsFor?.let { target -> EffectsSheet(vm, if (target == SELECTION) null else target, onDismiss = { effectsFor = null }) }
@@ -783,16 +770,6 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
             },
         )
     }
-    if (confirmDelete) {
-        val what = if (vm.hasRange) "${vm.rangeCount} frames" else "Frame ${vm.frameIndex + 1}"
-        ConfirmDialog(
-            "Delete frames?", "$what will be removed (you can undo this).", "Delete",
-            onDismiss = { confirmDelete = false },
-        ) {
-            confirmDelete = false
-            vm.deleteFrames()
-        }
-    }
     tracks.firstOrNull { it.id == renameTrack }?.let { t ->
         TextInputDialog("Rename track", t.name, onDismiss = { renameTrack = -1L }) {
             renameTrack = -1L
@@ -803,15 +780,6 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
         VolumeDialog("${t.name} volume", t.volume, onDismiss = { volumeTrack = -1L }) {
             volumeTrack = -1L
             vm.changeTrack(t.copy(volume = it))
-        }
-    }
-    tracks.firstOrNull { it.id == deleteTrack }?.let { t ->
-        ConfirmDialog(
-            "Delete track?", "\"${t.name}\" and its sounds will be removed (you can undo this).", "Delete",
-            onDismiss = { deleteTrack = -1L },
-        ) {
-            deleteTrack = -1L
-            vm.deleteTrack(t.id)
         }
     }
 }
@@ -869,8 +837,8 @@ private fun DrawScope.drawTimeline(
     val bottom = (if (expanded) rulerH + FRAMES_DP * dp else size.height) - 3 * dp
     val cellH = bottom - top
     val gap = 1.5f * dp
-    val labelStyle = TextStyle(color = Color.White, fontSize = 9.sp)
-    val badgeStyle = TextStyle(color = Color.Black, fontSize = 9.sp)
+    val labelStyle = Pg.Mark.copy(color = Pg.Text1)
+    val badgeStyle = Pg.Mark.copy(color = Pg.Text1)
     val playing = vm.isPlaying
     val current = if (playing) vm.playIndex else vm.frameIndex
     val last = min(f1, frames.lastIndex)
@@ -882,10 +850,7 @@ private fun DrawScope.drawTimeline(
         val w = hold * zoom - 2 * gap
         if (w <= 0f) continue
         val inRange = vm.hasRange && fi in vm.rangeStart..vm.rangeEnd
-        drawRoundRect(
-            if (inRange) RangeTint else colors.cell,
-            Offset(x0, top), Size(w, cellH), CornerRadius(4 * dp),
-        )
+        drawRoundRect(colors.cell, Offset(x0, top), Size(w, cellH), CornerRadius(2 * dp))
         // Thumbnail, fitted to the cell keeping the canvas aspect ratio.
         val img = if (fi == vm.frameIndex && !playing) vm.image else thumbs[uid]
         if (img != null && w >= 12 * dp) {
@@ -895,7 +860,7 @@ private fun DrawScope.drawTimeline(
             val th = vm.height * s
             val tx = x0 + (w - tw) / 2
             val ty = top + (cellH - th) / 2
-            drawRect(Color(0xFFBDBDBD), Offset(tx, ty), Size(tw, th))
+            drawCheckerboard(Rect(Offset(tx, ty), Size(tw, th)), max(2 * dp, min(tw, th) / 8))
             drawImage(
                 img,
                 dstOffset = IntOffset(tx.roundToInt(), ty.roundToInt()),
@@ -917,15 +882,20 @@ private fun DrawScope.drawTimeline(
             val badge = measurer.measure("×$hold", badgeStyle)
             val bx = x0 + w - badge.size.width - 6 * dp
             drawRoundRect(
-                colors.primary, Offset(bx, top + 2 * dp),
+                Color(0xAA000000), Offset(bx, top + 2 * dp),
                 Size(badge.size.width + 4 * dp, badge.size.height.toFloat()), CornerRadius(3 * dp),
             )
             drawText(badge, topLeft = Offset(bx + 2 * dp, top + 2 * dp))
         }
+        if (inRange) {
+            // Frames in the selected range: a yellow wash with a thin outline.
+            drawRoundRect(Pg.AccentWeak, Offset(x0, top), Size(w, cellH), CornerRadius(2 * dp))
+            drawRoundRect(colors.primary.copy(alpha = 0.6f), Offset(x0, top), Size(w, cellH), CornerRadius(2 * dp), style = Stroke(1.5f * dp))
+        }
         if (fi == current) {
             drawRoundRect(
-                colors.primary, Offset(x0, top), Size(w, cellH), CornerRadius(4 * dp),
-                style = Stroke(2.5f * dp),
+                colors.primary, Offset(x0, top), Size(w, cellH), CornerRadius(2 * dp),
+                style = Stroke(2f * dp),
             )
         }
     }
@@ -941,7 +911,7 @@ private fun DrawScope.drawTimeline(
         val stepSec = candidates.firstOrNull { it * fps >= minTicks } ?: 3600.0
         val stepTicks = stepSec * fps // may be less than a frame when zoomed in on sound
         var k = ceil((scroll / zoom) / stepTicks).toLong()
-        val rulerStyle = TextStyle(color = colors.text, fontSize = 9.sp)
+        val rulerStyle = Pg.Mark.copy(color = colors.text)
         while (true) {
             val tick = k * stepTicks
             val x = (tick * zoom - scroll).toFloat()
@@ -983,8 +953,8 @@ private fun DrawScope.drawAudio(
     val tool = vm.soundTool
     fun msToX(ms: Long) = (ms * fps / 1000f) * zoom - scroll
     val msPerPx = 1000.0 / fps / zoom
-    val nameStyle = TextStyle(color = Color.White, fontSize = 9.sp)
-    val labelStyle = TextStyle(color = colors.text, fontSize = 10.sp)
+    val nameStyle = Pg.Mark.copy(color = Pg.Text1)
+    val labelStyle = TextStyle(color = Pg.Text1, fontSize = 12.sp, fontWeight = FontWeight.Medium)
     val gains = ClipGain.all(tracks, clips, withTrackVolume = false)
     val scale = if (sound) vm.waveScale.toFloat() else 1f
     val mm = FloatArray(2)
@@ -996,10 +966,10 @@ private fun DrawScope.drawAudio(
             if (y0 + rowH < top || y0 > top + rowsH) return@forEachIndexed
             val selected = vm.selectedTrackId == t.id
             drawRect(
-                if (selected) colors.primary.copy(alpha = 0.10f) else if (ti % 2 == 0) Color(0x14FFFFFF) else Color(0x08FFFFFF),
+                if (selected) colors.primary.copy(alpha = 0.08f) else if (ti % 2 == 0) Color(0x14FFFFFF) else Color(0x08FFFFFF),
                 Offset(0f, y0), Size(size.width, rowH),
             )
-            val color = TrackColors[ti % TrackColors.size].let { if (t.muted) it.copy(alpha = 0.35f) else it }
+            val color = Pg.Tracks[ti % Pg.Tracks.size].let { if (t.muted) it.copy(alpha = 0.35f) else it }
             for (c in clips) {
                 if (c.trackId != t.id) continue
                 val x0 = msToX(c.startMs)
@@ -1114,14 +1084,18 @@ private fun DrawScope.drawAudio(
                     drawText(name, topLeft = Offset(max(x0, 0f) + 4 * dp, cy0 + 1 * dp))
                 }
                 if (vm.selectedClipId == c.id) {
-                    drawRoundRect(Color.White, Offset(x0, cy0), Size(x1 - x0, ch), CornerRadius(4 * dp), style = Stroke(2 * dp))
+                    drawRoundRect(Pg.Accent, Offset(x0, cy0), Size(x1 - x0, ch), CornerRadius(4 * dp), style = Stroke(2 * dp))
                 }
             }
             // Track name chip (fixed at the left edge).
-            val label = measurer.measure((if (t.muted) "🔇 " else "") + t.name.take(10), labelStyle)
+            // Muted tracks: the name greyed out and struck through.
+            val label = measurer.measure(
+                t.name.take(10),
+                if (t.muted) labelStyle.copy(color = Pg.Text3, textDecoration = TextDecoration.LineThrough) else labelStyle,
+            )
             val chipH = min(rowH - 8 * dp, 32 * dp)
             drawRoundRect(
-                Color(0xCC1E1E24), Offset(2 * dp, y0 + 4 * dp),
+                Pg.Surface1.copy(alpha = 0.88f), Offset(2 * dp, y0 + 4 * dp),
                 Size(min(label.size.width + 10 * dp, 70 * dp), chipH), CornerRadius(6 * dp),
             )
             clipRect(2 * dp, y0, 70 * dp, y0 + rowH) {
@@ -1135,10 +1109,10 @@ private fun DrawScope.drawAudio(
             tracks.forEachIndexed { ti, t ->
                 if (t.id !in s.tracks) return@forEachIndexed
                 val y0 = top + ti * rowH - vScroll
-                drawRect(Color(0x553DD6A0), Offset(sx0, y0), Size(sx1 - sx0, rowH))
+                drawRect(Pg.AccentWeak, Offset(sx0, y0), Size(sx1 - sx0, rowH))
                 for (ex in listOf(sx0, sx1)) {
-                    drawLine(Color(0xFF3DD6A0), Offset(ex, y0), Offset(ex, y0 + rowH), 2 * dp)
-                    drawCircle(Color(0xFF3DD6A0), 6 * dp, Offset(ex, y0 + rowH / 2))
+                    drawLine(Pg.Accent, Offset(ex, y0), Offset(ex, y0 + rowH), 2 * dp)
+                    drawCircle(Pg.Accent, 6 * dp, Offset(ex, y0 + rowH / 2))
                 }
             }
         }
@@ -1146,18 +1120,18 @@ private fun DrawScope.drawAudio(
     // Where the animation ends: beyond it, it repeats (loop to sound) or the sound is cut.
     val endX = animTicks * zoom - scroll
     if (totalTicks > animTicks && endX < size.width) {
-        val shade = if (vm.loopToAudio) Color(0x1A3DD6A0) else Color(0x66000000)
+        val shade = if (vm.loopToAudio) Color(0x0DFFFFFF) else Color(0x66000000)
         drawRect(shade, Offset(max(endX, 0f), top - FRAMES_DP * dp), Size(size.width - max(endX, 0f), FRAMES_DP * dp + rowsH))
         drawLine(colors.text.copy(alpha = 0.6f), Offset(endX, top - FRAMES_DP * dp), Offset(endX, top + rowsH), 1.5f * dp)
-        val text = if (vm.loopToAudio) "↻ animation repeats" else "sound after here is cut (turn on looping)"
-        drawText(measurer.measure(text, TextStyle(color = colors.text, fontSize = 9.sp)), topLeft = Offset(max(endX, 0f) + 4 * dp, top - FRAMES_DP * dp + 2 * dp))
+        val text = if (vm.loopToAudio) "animation repeats" else "sound after here is cut (turn on looping)"
+        drawText(measurer.measure(text, Pg.Mark.copy(color = colors.text)), topLeft = Offset(max(endX, 0f) + 4 * dp, top - FRAMES_DP * dp + 2 * dp))
     }
     // Add-track row
     val addTop = top + rowsH
     drawRect(Color(0x10FFFFFF), Offset(0f, addTop), Size(size.width, ADD_ROW_DP * dp))
     drawText(
-        measurer.measure(if (tracks.isEmpty()) "＋ Add a sound track (or use 🎤 / ♫ above)" else "＋ Add track", labelStyle),
-        topLeft = Offset(8 * dp, addTop + 6 * dp),
+        measurer.measure(if (tracks.isEmpty()) "+  Add a sound track" else "+  Add track", labelStyle.copy(color = Pg.Text2)),
+        topLeft = Offset(12 * dp, addTop + 9 * dp),
     )
     // Playhead through everything: where the sound is while playing, else the cursor / current frame.
     val timing = vm.timing()
@@ -1167,7 +1141,8 @@ private fun DrawScope.drawAudio(
         timing != null && vm.frameIndex in 0 until timing.frameCount -> timing.startTick(vm.frameIndex) * zoom - scroll
         else -> null
     }
-    if (headX != null) drawLine(colors.primary, Offset(headX, 0f), Offset(headX, size.height), 2 * dp)
+    // It stops at the last row (sound mode leaves empty space below the tracks).
+    if (headX != null) drawLine(Pg.Live, Offset(headX, 0f), Offset(headX, min(size.height, addTop + ADD_ROW_DP * dp)), 2 * dp)
 }
 
 /** A fade drawn as a shaded triangle over the clip (the part that's quieter). */
@@ -1196,12 +1171,52 @@ private fun DrawScope.drawFadeShade(xa: Float, xb: Float, top: Float, h: Float, 
 
 @Composable
 internal fun PlayButton(vm: EditorViewModel) {
-    SmallIconButton(
+    RoundIconButton(
         if (vm.isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow,
         if (vm.isPlaying) "Stop" else "Play",
-        enabled = vm.frameCount > 1 || vm.clips().isNotEmpty(),
         onClick = vm::togglePlay,
+        enabled = vm.frameCount > 1 || vm.clips().isNotEmpty(),
     )
+}
+
+@Composable
+private fun OnionToggle(vm: EditorViewModel) {
+    PgIconButton(OnionSkinIcon, "Onion skin", vm::toggleOnionSkin, checked = vm.onionSkin)
+}
+
+private fun duplicateLabel(vm: EditorViewModel) = if (vm.duplicateToEnd) "Duplicate frame to end" else "Duplicate frame"
+
+/**
+ * The grab handle on top of the timeline: tap it, or drag up for the full timeline with sound
+ * and down for a single row of frames.
+ */
+@Composable
+private fun TimelineHandle(expanded: Boolean, onExpand: (Boolean) -> Unit) {
+    val dp = LocalDensity.current.density
+    val setExpanded by rememberUpdatedState(onExpand)
+    var drag by remember { mutableFloatStateOf(0f) }
+    val label = if (expanded) "Smaller timeline" else "Bigger timeline (with sound)"
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(20.dp)
+            .semantics { contentDescription = label }
+            .clickable(onClickLabel = label, role = Role.Button) { setExpanded(!expanded) }
+            .pointerInput(Unit) {
+                detectVerticalDragGestures(
+                    onDragStart = { drag = 0f },
+                    onDragEnd = {
+                        if (drag < -24 * dp) setExpanded(true) else if (drag > 24 * dp) setExpanded(false)
+                    },
+                ) { change, amount ->
+                    change.consume()
+                    drag += amount
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(Modifier.size(width = 32.dp, height = 4.dp).clip(RoundedCornerShape(2.dp)).background(Pg.Text3))
+    }
 }
 
 /** Long-press menu for one frame. */
@@ -1218,6 +1233,7 @@ private fun FrameMenu(
         if (index !in frames.indices) return@DropdownMenu
         val hasClip = vm.frameClipInfo != null
         fun item(text: String, enabled: Boolean = true, action: () -> Unit) = Pair(text, enabled to action)
+        val deleteLabel = "Delete"
         val items = listOf(
             item("Select frames from here") { vm.startRangeAt(index); vm.selectFrame(index) },
             null,
@@ -1233,7 +1249,7 @@ private fun FrameMenu(
             item("Hold… (now ${frames[index].hold}×)") { onHold(index) },
             item("Move left", index > 0) { vm.moveFrame(index, index - 1) },
             item("Move right", index < frames.lastIndex) { vm.moveFrame(index, index + 1) },
-            item("Delete", frames.size > 1) { vm.clearRange(); onDelete(index) },
+            item(deleteLabel, frames.size > 1) { vm.clearRange(); onDelete(index) },
         )
         items.forEach { entry ->
             if (entry == null) {
@@ -1241,97 +1257,55 @@ private fun FrameMenu(
             } else {
                 val (text, rest) = entry
                 val (enabled, action) = rest
-                DropdownMenuItem(text = { Text(text) }, enabled = enabled, onClick = { onDismiss(); action() })
+                DropdownMenuItem(
+                    text = { Text(text, color = if (text == deleteLabel && enabled) Pg.Danger else Color.Unspecified) },
+                    enabled = enabled,
+                    onClick = { onDismiss(); action() },
+                )
             }
         }
     }
 }
 
-/** Actions for a selected run of frames. */
+/** Actions for a selected run of frames: the common ones, then More. Delete offers Undo. */
 @Composable
-private fun RangeBar(vm: EditorViewModel, onHold: () -> Unit, onDelete: () -> Unit) {
-    var pasteMenu by remember { mutableStateOf(false) }
-    var dupMenu by remember { mutableStateOf(false) }
+private fun RangeBar(vm: EditorViewModel, onHold: () -> Unit) {
+    val sel = vm.hasRange
+    val n = vm.rangeCount
     val hasClip = vm.frameClipInfo != null
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .height(52.dp)
-            .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.12f))
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-    ) {
-        Text(
-            if (vm.hasRange) "Frames ${vm.rangeStart + 1}–${vm.rangeEnd + 1}\n(${vm.rangeCount})" else "Tap frames",
-            style = MaterialTheme.typography.labelSmall,
-            modifier = Modifier.padding(end = 4.dp),
-        )
-        val sel = vm.hasRange
-        RangeButton(Icons.Filled.ContentCopy, "Copy", sel) { vm.copyFrames() }
-        RangeButton(Icons.Filled.ContentCut, "Cut", sel) { vm.copyFrames(cut = true) }
-        Box {
-            RangeButton(Icons.Filled.ContentPaste, "Paste", hasClip) { pasteMenu = true }
-            DropdownMenu(expanded = pasteMenu, onDismissRequest = { pasteMenu = false }) {
-                vm.frameClipInfo?.let {
-                    Text(
-                        "${it.frames} frame${if (it.frames == 1) "" else "s"} on clipboard",
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                    )
-                }
-                DropdownMenuItem(text = { Text("Before selection") }, onClick = { pasteMenu = false; vm.pasteFrames(FramePosition.BEFORE) })
-                DropdownMenuItem(text = { Text("After selection") }, onClick = { pasteMenu = false; vm.pasteFrames(FramePosition.AFTER) })
-                DropdownMenuItem(text = { Text("At the end") }, onClick = { pasteMenu = false; vm.pasteFrames(FramePosition.END) })
-            }
-        }
-        Box {
-            RangeButton(Icons.Filled.LibraryAdd, "Duplicate", sel) { dupMenu = true }
-            DropdownMenu(expanded = dupMenu, onDismissRequest = { dupMenu = false }) {
-                DropdownMenuItem(text = { Text("After selection") }, onClick = { dupMenu = false; vm.duplicateFrames(toEnd = false) })
-                DropdownMenuItem(text = { Text("At the end") }, onClick = { dupMenu = false; vm.duplicateFrames(toEnd = true) })
-            }
-        }
-        RangeButton(Icons.Filled.SwapHoriz, "Reverse", sel && vm.rangeCount > 1) { vm.reverseFrames() }
-        RangeButton(Icons.Filled.Timer, "Hold", sel) { onHold() }
-        RangeButton(Icons.AutoMirrored.Filled.ArrowBack, "Earlier", sel && vm.rangeStart > 0) { vm.moveFrames(-1) }
-        RangeButton(Icons.AutoMirrored.Filled.ArrowForward, "Later", sel && vm.rangeEnd < vm.frameCount - 1) { vm.moveFrames(1) }
-        RangeButton(Icons.Filled.Delete, "Delete", sel && vm.rangeCount < vm.frameCount) { onDelete() }
-        RangeButton(Icons.Filled.Close, "Done", true) { vm.toggleRangeMode() }
-    }
-}
-
-@Composable
-private fun RangeButton(icon: ImageVector, label: String, enabled: Boolean, onClick: () -> Unit) {
-    Column(
-        Modifier
-            .clip(RoundedCornerShape(10.dp))
-            .clickable(enabled = enabled, onClick = onClick)
-            .alpha(if (enabled) 1f else 0.35f)
-            .padding(horizontal = 7.dp, vertical = 2.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Icon(icon, label, Modifier.size(20.dp))
-        Text(label, fontSize = 10.sp, maxLines = 1)
-    }
-}
-
-@Composable
-fun SmallIconButton(
-    icon: ImageVector,
-    label: String,
-    enabled: Boolean = true,
-    selected: Boolean = false,
-    size: androidx.compose.ui.unit.Dp = 40.dp,
-    onClick: () -> Unit,
-) {
-    IconButton(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = Modifier.size(size),
-        colors = if (selected) IconButtonDefaults.filledIconButtonColors() else IconButtonDefaults.iconButtonColors(),
-    ) { Icon(icon, label, Modifier.size(22.dp)) }
+    ActionBar(
+        lead = when {
+            !sel -> "Tap frames"
+            n == 1 -> "Frame ${vm.rangeStart + 1}"
+            else -> "$n frames"
+        },
+        onClose = vm::toggleRangeMode,
+        closeLabel = "Done selecting frames",
+        actions = listOf(
+            BarAction("Copy", Icons.Filled.ContentCopy, enabled = sel) { vm.copyFrames() },
+            BarAction("Cut", Icons.Filled.ContentCut, enabled = sel) { vm.copyFrames(cut = true) },
+            BarAction(
+                "Paste", Icons.Filled.ContentPaste, enabled = hasClip,
+                choices = listOf(
+                    Choice("Paste before selection") { vm.pasteFrames(FramePosition.BEFORE) },
+                    Choice("Paste after selection") { vm.pasteFrames(FramePosition.AFTER) },
+                    Choice("Paste at the end") { vm.pasteFrames(FramePosition.END) },
+                ),
+            ),
+            BarAction("Delete", Icons.Filled.Delete, enabled = sel && n < vm.frameCount, destructive = true) { vm.deleteFrames() },
+            BarAction(
+                "Duplicate", Icons.Filled.LibraryAdd, enabled = sel,
+                choices = listOf(
+                    Choice("Duplicate after selection") { vm.duplicateFrames(toEnd = false) },
+                    Choice("Duplicate at the end") { vm.duplicateFrames(toEnd = true) },
+                ),
+            ),
+            BarAction("Reverse", Icons.Filled.SwapHoriz, enabled = sel && n > 1) { vm.reverseFrames() },
+            BarAction("Hold…", Icons.Filled.Timer, enabled = sel) { onHold() },
+            BarAction("Move earlier", Icons.AutoMirrored.Filled.ArrowBack, enabled = sel && vm.rangeStart > 0) { vm.moveFrames(-1) },
+            BarAction("Move later", Icons.AutoMirrored.Filled.ArrowForward, enabled = sel && vm.rangeEnd < vm.frameCount - 1) { vm.moveFrames(1) },
+        ),
+    )
 }
 
 /** 0–200% volume. */
@@ -1342,12 +1316,12 @@ fun VolumeDialog(title: String, initial: Float, onDismiss: () -> Unit, onConfirm
         onDismissRequest = onDismiss,
         title = { Text(title) },
         text = {
-            Column {
-                Text("${(v * 100).roundToInt()}%")
-                Slider(value = v, onValueChange = { v = it }, valueRange = 0f..2f)
-            }
+            SliderRow(
+                "Volume", "${(v * 100).roundToInt()}%", v,
+                onValueChange = { v = (it * 20).roundToInt() / 20f }, valueRange = 0f..2f, step = 0.05f,
+            )
         },
-        confirmButton = { TextButton(onClick = { onConfirm(v) }) { Text("OK") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        confirmButton = { PrimaryButton("OK", onClick = { onConfirm(v) }) },
+        dismissButton = { PgTextButton("Cancel", onClick = onDismiss) },
     )
 }

@@ -22,7 +22,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import com.pixelgo.ui.theme.Pg
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -78,7 +78,7 @@ fun ColorPickerDialog(
     }
 
     Dialog(onDismissRequest = onDismiss) {
-        Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+        Surface(shape = RoundedCornerShape(16.dp), color = Pg.Surface2) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("Pick color", style = MaterialTheme.typography.titleLarge)
 
@@ -124,7 +124,7 @@ fun ColorPickerDialog(
                 }
 
                 // Alpha bar
-                Text("Opacity ${(alpha * 100 / 255)}%", style = MaterialTheme.typography.labelMedium)
+                Text("Opacity ${(alpha * 100 / 255)}%", style = Pg.Data, color = Pg.Text2)
                 Canvas(
                     Modifier
                         .fillMaxWidth()
@@ -145,9 +145,9 @@ fun ColorPickerDialog(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    ColorSwatch(initial, size = 44.dp)
+                    ColorSwatch(initial, size = 44.dp, label = "Old color")
                     Spacer(Modifier.width(4.dp))
-                    ColorSwatch(current(), size = 44.dp)
+                    ColorSwatch(current(), size = 44.dp, label = "New color")
                     Spacer(Modifier.width(12.dp))
                     OutlinedTextField(
                         value = hexText,
@@ -164,7 +164,7 @@ fun ColorPickerDialog(
                 }
 
                 if (recent.isNotEmpty()) {
-                    Text("Recent", style = MaterialTheme.typography.labelMedium)
+                    Text("Recent", style = MaterialTheme.typography.labelMedium, color = Pg.Text2)
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(recent) { c ->
                             ColorSwatch(c, Modifier.clickable { setFromColor(c); syncHex() }, size = 32.dp)
@@ -172,9 +172,9 @@ fun ColorPickerDialog(
                     }
                 }
 
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = onDismiss) { Text("Cancel") }
-                    TextButton(onClick = { onConfirm(current()) }) { Text("OK") }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
+                    PgTextButton("Cancel", onClick = onDismiss)
+                    PrimaryButton("Use color", onClick = { onConfirm(current()) })
                 }
             }
         }
