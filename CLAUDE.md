@@ -33,7 +33,7 @@ Needs `ANDROID_HOME` or `local.properties` (`sdk.dir=...`). `local.properties` i
   - Call `store.edit(layer, frame)` before every write.
   - Bulk work goes through a `BulkJob` (writes with `put`/`copy` off the main thread).
   - Track frames by **uid**, not index.
-- Keep `editor/`, `data/Serializers.kt`, `MetaSerializer`, `DiskCelStore`, `Migration`, `FrameClipboard`, `data/audio/PcmFiles.kt`, `GifEncoder` and `data/video/{VideoLayout,YuvFrame,MovPatcher}` free of Android imports so they stay unit-testable.
+- Keep `editor/` (including `audiofx/` and `denoise/`), `data/Serializers.kt`, `MetaSerializer`, `DiskCelStore`, `Migration`, `FrameClipboard`, `data/audio/{PcmFiles,SoundRender,SoundClipboard}.kt`, `GifEncoder` and `data/video/{VideoLayout,YuvFrame,MovPatcher}` free of Android imports so they stay unit-testable.
 - Model objects are mutated in place. The UI must read `vm.renderTick` / `vm.structureTick` to see changes. Lazy lists and gesture handlers must read live state (see ARCHITECTURE §9).
 - **Saving:** snapshot on the UI thread, write on the repository's IO thread. Never touch live editor objects from IO threads. Background readers use `AnimationSnapshot`.
 - **File format:** `project.meta` uses tagged sections; add new data as a new tag. Incompatible changes bump the version, keep old readers working, and need tests (migration test included).
@@ -43,6 +43,12 @@ Needs `ANDROID_HOME` or `local.properties` (`sdk.dir=...`). `local.properties` i
   - `AudioDecoder` must not trim `encoder-delay` itself: the codec already does.
   - Recordings are lined up by the count-in ticks the mic hears (`CountIn`), not by audio timestamps, which were ~0.1 s off on the test phone.
   - Re-run `MediaDeviceTest` after touching any media code.
+- **Sound editing:**
+  - Clip levels (volume, fades, volume line, crossfades) are computed only in `ClipGain`, which both the mixer and the waveform drawing use. Don't compute them a second way.
+  - Volume-line points are in *source* ms (they move with the sound when it's trimmed or split).
+  - Cut edges get `DECLICK_MS` fades. Processed effects make a **new asset**; never rewrite a `.pcm` that a clip or undo may still use.
+  - Multi-step actions that finish in the background use `beginGroup` / `endGroup`, and `cancelGroup` on failure.
+- **Noise removal** (`editor/denoise/RnNoise.kt`) is a faithful port of RNNoise v0.1.1. `RnNoiseTest` must stay under −60 dB from the ffmpeg reference. If the weights change, regenerate `rnnoise.bin` and the test reference with the scripts in `tools/` (see their headers). Keep the BSD notice (`assets/RNNOISE-LICENSE.txt`).
 - Product decisions in the README were made by the owner. Ask before changing them.
 
 ## Testing on a real phone

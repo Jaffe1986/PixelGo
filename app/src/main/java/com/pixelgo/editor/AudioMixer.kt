@@ -38,8 +38,9 @@ class MemoryPcm(private val data: ShortArray, override val channels: Int) : PcmS
 }
 
 /**
- * Mixes the project's clips (with clip volume × track volume, muted tracks skipped, trims
- * applied) into 48 kHz stereo 16-bit. Used for both preview playback and video export.
+ * Mixes the project's clips (clip volume × track volume × fades × volume line × crossfades,
+ * see [ClipGain]; muted tracks skipped, trims applied) into 48 kHz stereo 16-bit. Used for both
+ * preview playback and video export.
  * Takes snapshots of the track/clip lists, so the UI may keep editing meanwhile.
  */
 class AudioMixer(
@@ -49,8 +50,10 @@ class AudioMixer(
 ) {
     private val trackById = tracks.associateBy { it.id }
     private val clips = clips.toList()
+    private val gains = ClipGain.all(tracks, this.clips)
     private var acc = FloatArray(0)
     private var tmp = FloatArray(0)
+    private var g = FloatArray(0)
 
     /** End of the last audible clip, in frames. */
     val endFrame: Long = this.clips.filter { trackById[it.trackId]?.muted == false }
@@ -63,14 +66,15 @@ class AudioMixer(
         if (acc.size < count * 2) {
             acc = FloatArray(count * 2)
             tmp = FloatArray(count * 2)
+            g = FloatArray(count)
         }
         java.util.Arrays.fill(acc, 0, count * 2, 0f)
         val end = start + count
         for (c in clips) {
             val track = trackById[c.trackId] ?: continue
             if (track.muted) continue
-            val gain = c.volume * track.volume
-            if (gain <= 0f) continue
+            val cg = gains[c.id] ?: continue
+            if (cg.base <= 0f) continue
             val cs = c.startMs * FRAMES_PER_MS
             val ce = cs + c.durationMs * FRAMES_PER_MS
             val from = maxOf(start, cs)
@@ -80,7 +84,17 @@ class AudioMixer(
             val n = (to - from).toInt()
             src.readStereo(c.inMs * FRAMES_PER_MS + (from - cs), n, tmp)
             val off = ((from - start) * 2).toInt()
-            for (i in 0 until n * 2) acc[off + i] += tmp[i] * gain
+            if (cg.isFlat) {
+                val gain = cg.base
+                for (i in 0 until n * 2) acc[off + i] += tmp[i] * gain
+            } else {
+                // Fades, crossfades and the volume line change the gain sample by sample.
+                cg.fill(from - cs, n, g)
+                for (i in 0 until n) {
+                    acc[off + 2 * i] += tmp[2 * i] * g[i]
+                    acc[off + 2 * i + 1] += tmp[2 * i + 1] * g[i]
+                }
+            }
         }
         for (i in 0 until count * 2) {
             val v = acc[i] * 32767f

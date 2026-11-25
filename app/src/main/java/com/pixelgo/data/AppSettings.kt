@@ -18,6 +18,22 @@ class AppSettings(context: Context) {
         prefs.edit().putBoolean(KEY_DUP_TO_END, value).apply()
     }
 
+    /** Sound mode: waveform magnification (1, 2, 4, 8 or 16) and track height (dp). */
+    var waveScale by mutableStateOf(prefs.getInt(KEY_WAVE_SCALE, 1))
+        private set
+    var trackHeightDp by mutableStateOf(prefs.getFloat(KEY_TRACK_HEIGHT, 96f))
+        private set
+
+    fun updateWaveScale(value: Int) {
+        waveScale = value
+        prefs.edit().putInt(KEY_WAVE_SCALE, value).apply()
+    }
+
+    fun updateTrackHeight(dp: Float) {
+        trackHeightDp = dp
+        prefs.edit().putFloat(KEY_TRACK_HEIGHT, dp).apply()
+    }
+
     /**
      * How far off (ms) the audio timestamps were when the count-in last lined up a recording on
      * this speaker/microphone [route]; null if never measured. Used when there's no count-in
@@ -33,5 +49,7 @@ class AppSettings(context: Context) {
     companion object {
         private const val KEY_DUP_TO_END = "duplicate_to_end"
         private const val KEY_REC_CORRECTION = "record_correction_"
+        private const val KEY_WAVE_SCALE = "wave_scale"
+        private const val KEY_TRACK_HEIGHT = "track_height_dp"
     }
 }

@@ -147,6 +147,20 @@ class PcmFile(file: File) : PcmSource, Closeable {
 object Peaks {
     fun read(file: File): ByteArray = if (file.exists()) file.readBytes() else ByteArray(0)
 
+    /** Lowest and highest level (-1..1) between two times into [out] (min, max). */
+    fun minMax(peaks: ByteArray, fromMs: Long, toMs: Long, out: FloatArray) {
+        val a = (fromMs / 10).toInt().coerceAtLeast(0)
+        val b = max(a + 1, (toMs / 10).toInt()).coerceAtMost(peaks.size / 2)
+        var lo = 0
+        var hi = 0
+        for (i in a until b) {
+            lo = min(lo, peaks[2 * i].toInt())
+            hi = max(hi, peaks[2 * i + 1].toInt())
+        }
+        out[0] = lo / 127f
+        out[1] = hi / 127f
+    }
+
     /** Largest absolute level (0..1) between two times, for drawing one waveform column. */
     fun level(peaks: ByteArray, fromMs: Long, toMs: Long): Float {
         val a = (fromMs / 10).toInt().coerceAtLeast(0)

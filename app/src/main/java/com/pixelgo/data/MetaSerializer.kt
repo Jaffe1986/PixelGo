@@ -3,6 +3,7 @@ package com.pixelgo.data
 import com.pixelgo.model.AudioAsset
 import com.pixelgo.model.AudioClip
 import com.pixelgo.model.Frame
+import com.pixelgo.model.GainPoint
 import com.pixelgo.model.Layer
 import com.pixelgo.model.SoundTrack
 import com.pixelgo.model.MAX_CANVAS_SIZE
@@ -56,6 +57,7 @@ object MetaSerializer {
     private const val TAG_LAYERS = 2
     private const val TAG_FRAMES = 3
     private const val TAG_AUDIO = 4
+    private const val TAG_AUDIO_LEVELS = 5 // fades + volume lines of the clips that have them
 
     fun toBytes(p: PixelProject, modified: Long): ByteArray =
         ByteArrayOutputStream().also { write(p, modified, it) }.toByteArray()
@@ -126,6 +128,22 @@ object MetaSerializer {
                 writeFloat(it.volume)
             }
         }
+        val levelled = p.clips.filter { it.hasLevels }
+        if (levelled.isNotEmpty()) {
+            section(body, TAG_AUDIO_LEVELS) {
+                writeInt(levelled.size)
+                levelled.forEach { c ->
+                    writeLong(c.id)
+                    writeLong(c.fadeInMs)
+                    writeLong(c.fadeOutMs)
+                    writeInt(c.envelope.size)
+                    c.envelope.forEach {
+                        writeLong(it.atMs)
+                        writeFloat(it.gain)
+                    }
+                }
+            }
+        }
         body.writeInt(TAG_END)
         body.flush()
         z.finish()
@@ -168,6 +186,8 @@ object MetaSerializer {
         var layers: List<Layer>? = null
         var frames: List<Frame>? = null
         var audio: ((PixelProject) -> Unit)? = null
+        // Fades / volume lines by clip id (their section may come before or after the clips).
+        val levels = HashMap<Long, (AudioClip) -> AudioClip>()
         while (true) {
             val tag = body.readInt()
             if (tag == TAG_END) break
@@ -198,11 +218,18 @@ object MetaSerializer {
                         p.loopToAudio = loop
                         p.tracks += tracks
                         p.assets += assets
-                        p.clips += clips
+                        p.clips += clips.map { c -> levels[c.id]?.invoke(c) ?: c }
                         p.nextTrackId = maxOf(nt, (tracks.maxOfOrNull { it.id } ?: 0L) + 1)
                         p.nextClipId = maxOf(nc, (clips.maxOfOrNull { it.id } ?: 0L) + 1)
                         p.nextAssetId = maxOf(na, (assets.maxOfOrNull { it.id } ?: 0L) + 1)
                     }
+                }
+                TAG_AUDIO_LEVELS -> repeat(s.readInt()) {
+                    val clipId = s.readLong()
+                    val fadeIn = s.readLong()
+                    val fadeOut = s.readLong()
+                    val envelope = List(s.readInt()) { GainPoint(s.readLong(), s.readFloat()) }
+                    levels[clipId] = { c -> c.copy(fadeInMs = fadeIn, fadeOutMs = fadeOut, envelope = envelope) }
                 }
                 else -> Unit // a newer section this version doesn't know: skip
             }

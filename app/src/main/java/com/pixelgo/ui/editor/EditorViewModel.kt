@@ -68,6 +68,12 @@ enum class LoadState { Loading, Ready, Failed }
 
 enum class RecordState { Idle, CountIn, Recording }
 
+/** What dragging on a sound track does in sound mode. */
+enum class SoundTool { Move, Select, Volume }
+
+/** A section of sound: [fromMs, toMs) on [tracks]. */
+data class SoundSelection(val tracks: Set<Long>, val fromMs: Long, val toMs: Long)
+
 /** Zoom / pan state. [scale] is screen pixels per art pixel; [offset] is the canvas top-left on screen. */
 class Viewport {
     var scale by mutableFloatStateOf(0f)
@@ -312,7 +318,9 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
 
     fun selectFrame(i: Int) {
         val e = engine ?: return
-        if (isBusy || i == e.project.currentFrameIndex) return
+        if (isBusy) return
+        cursorMs = null // the sound cursor follows the chosen frame
+        if (i == e.project.currentFrameIndex) return
         stopPlaying()
         e.cancelStroke()
         commitFloating()
@@ -1081,6 +1089,7 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
     override fun onCleared() {
         stopRecording(keep = true)
         stopPlaying()
+        stopCleanupPreview()
         engine?.cancelStroke()
         save()
     }
@@ -1089,6 +1098,7 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
     fun onBackgrounded() {
         if (recordState != RecordState.Idle) stopRecording(keep = true)
         stopPlaying()
+        stopCleanupPreview()
         save()
     }
 
@@ -1206,7 +1216,7 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
      * The microphone starts first, so it also hears the count-in ticks; [stopRecording] uses them
      * to line the recording up exactly (see [CountIn]).
      */
-    fun startRecording(voiceOver: Boolean, withCountIn: Boolean, trackId: Long?) {
+    fun startRecording(voiceOver: Boolean, withCountIn: Boolean, trackId: Long?, fromMs: Long? = null) {
         val e = engine ?: return
         if (isBusy || recordState != RecordState.Idle) return
         if (freeSpaceMb() < 50) {
@@ -1217,7 +1227,7 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
         e.cancelStroke()
         commitFloating()
         recordTrack = trackId
-        recordStartMs = currentFrameMs()
+        recordStartMs = fromMs ?: currentFrameMs()
         recordingAssetId = e.newAssetId()
         recordElapsedMs = 0
         recordJob = viewModelScope.launch {
@@ -1265,6 +1275,12 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
                     }
                 } else {
                     recordElapsedMs = (System.nanoTime() - t0) / 1_000_000
+                    // Re-recording a section: stop by itself a second after it.
+                    val p = punch
+                    if (p != null && isPlaying && playTick * 1000 / fps > p.toMs + 1_000) {
+                        stopRecording(keep = true)
+                        return@launch
+                    }
                 }
                 recordLevel = rec.level
                 delay(50)
@@ -1275,6 +1291,8 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
     /** Stops recording; with [keep], the recording becomes a clip (one undo step). */
     fun stopRecording(keep: Boolean = true) {
         val e = engine
+        val p = punch
+        punch = null
         recordJob?.cancel()
         recordJob = null
         val rec = recorder
@@ -1305,6 +1323,21 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
             pcmFile(assetId).delete()
             peaksFile(assetId).delete()
             if (keep) toast("Recording too short")
+            return
+        }
+        if (p != null) {
+            // Punch-in: keep just the selected part of the take, in place of the old sound there.
+            val takeIn = (startInRec + (p.fromMs - recordStartMs)).roundToLong().coerceAtLeast(0)
+            val takeOut = minOf(durationMs, (startInRec + (p.toMs - recordStartMs)).roundToLong())
+            if (takeOut - takeIn < 50) {
+                pcmFile(assetId).delete()
+                peaksFile(assetId).delete()
+                toast("The recording stopped before the selected part")
+                return
+            }
+            e.addAsset(AudioAsset(assetId, Names.numbered("Recording", project?.assets.orEmpty().map { it.name }), durationMs, 1))
+            e.placeOver(listOf(com.pixelgo.model.AudioClip(0, p.tracks.first(), assetId, p.fromMs, takeIn, takeOut, fadeInMs = 10, fadeOutMs = 10)))
+            changed(structure = true)
             return
         }
         val name = Names.numbered("Recording", project?.assets.orEmpty().map { it.name })
@@ -1364,8 +1397,9 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
     fun changeClip(c: com.pixelgo.model.AudioClip) = audioOp { it.changeClip(c) }
     fun deleteClip(id: Long) = audioOp { it.deleteClip(id); selectedClipId = null }
     fun duplicateClip(id: Long) = audioOp { it.duplicateClip(id) }
+    /** Splits the clip at the sound cursor (the current frame's start unless placed in sound mode). */
     fun splitClipAtCurrentFrame(id: Long) = audioOp {
-        if (!it.splitClip(id, currentFrameMs())) toast("Move to a frame inside the clip to split it")
+        if (!it.splitClip(id, soundCursorMs())) toast("Put the cursor inside the clip to split it")
     }
 
     fun addTrack() = audioOp { selectedTrackId = it.addTrack("Track ${tracks().size + 1}").id }
@@ -1382,6 +1416,395 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
         changed(structure = true)
     }
 
+    // ---- Sound mode (full-screen sound editing) -------------------------------------------------
+
+    /** The timeline fills the screen for detailed sound editing. */
+    var soundMode by mutableStateOf(false)
+        private set
+    var soundTool by mutableStateOf(SoundTool.Move)
+
+    /** The sound cursor (ms), finer than frames; null = the current frame's start. */
+    var cursorMs by mutableStateOf<Long?>(null)
+        private set
+
+    /** The selected section of sound (Select tool). */
+    var soundSel by mutableStateOf<SoundSelection?>(null)
+
+    val waveScale: Int get() = app.settings.waveScale
+    val trackHeightDp: Float get() = app.settings.trackHeightDp
+
+    /** Bumped when zoomed-in waveform data arrives, so the timeline redraws. */
+    var waveTick by mutableIntStateOf(0)
+        private set
+    val waveforms = WaveformCache(viewModelScope, { pcmFile(it) }) { waveTick++ }
+
+    fun enterSoundMode(on: Boolean) {
+        if (on) commitFloating()
+        soundMode = on
+        if (!on) {
+            soundSel = null
+            soundTool = SoundTool.Move
+        }
+    }
+
+    /** Waveform magnification: ×1, ×2, ×4, ×8 or ×16. */
+    fun setWaveScale(scale: Int) = app.settings.updateWaveScale(scale.coerceIn(1, 16))
+
+    fun setTrackHeight(dp: Float) = app.settings.updateTrackHeight(dp.coerceIn(40f, 240f))
+
+    /** Where split / paste / record-here happen: the sound cursor, or the current frame. */
+    fun soundCursorMs(): Long = cursorMs ?: currentFrameMs()
+
+    /** Puts the sound cursor at [ms] and shows the frame playing then. */
+    fun setCursor(ms: Long) {
+        val p = project ?: return
+        val clamped = ms.coerceAtLeast(0)
+        val tick = clamped * p.fps / 1000
+        // Selecting a frame resets the cursor to its start, so set the cursor afterwards.
+        selectFrame(p.timing.frameAtTick(tick % p.timing.totalTicks))
+        cursorMs = clamped
+    }
+
+    /** Tracks an action applies to: the selection's, else the selected track, else all. */
+    private fun soundTracks(): Set<Long> =
+        soundSel?.tracks ?: selectedTrackId?.let { setOf(it) } ?: tracks().map { it.id }.toSet()
+
+    fun splitAtCursor() = audioOp {
+        val sel = soundSel
+        val ok = if (sel != null) it.splitSection(sel.tracks, sel.fromMs, sel.toMs) else it.splitAt(soundTracks(), soundCursorMs())
+        if (!ok) toast("No sound to split there")
+    }
+
+    /** Delete the selected section (leaving silence), or with [closeGap] pull later sound left. */
+    fun deleteSelection(closeGap: Boolean) = selectionOp { e, s ->
+        if (!e.deleteSection(s.tracks, s.fromMs, s.toMs, closeGap) && !closeGap) toast("No sound in the selection")
+    }
+
+    /** Opens silence as long as the selection, at its start (later sound moves right). */
+    fun insertSilence() = selectionOp { e, s -> e.insertSilence(s.tracks, s.fromMs, s.toMs - s.fromMs) }
+
+    fun duplicateSelection() = selectionOp { e, s ->
+        if (e.duplicateSection(s.tracks, s.fromMs, s.toMs).isEmpty()) toast("No sound in the selection")
+        else soundSel = s.copy(fromMs = s.toMs, toMs = 2 * s.toMs - s.fromMs)
+    }
+
+    fun fadeSelection(fadeIn: Boolean) = selectionOp { e, s ->
+        e.scaleSection(s.tracks, s.fromMs, s.toMs, if (fadeIn) 0f else 1f, if (fadeIn) 1f else 0f)
+    }
+
+    fun setSelectionVolume(gain: Float) = selectionOp { e, s -> e.scaleSection(s.tracks, s.fromMs, s.toMs, gain, gain) }
+
+    private inline fun selectionOp(op: (EditorEngine, SoundSelection) -> Unit) {
+        val s = soundSel ?: return toast("Select a section first (Select tool, then drag)")
+        audioOp { op(it, s) }
+    }
+
+    // ---- Effects, sound clipboard ------------------------------------------------------------
+
+    /** Something is on the sound clipboard (from any project). */
+    val canPasteSound: Boolean get() = app.soundClipInfo != null
+
+    /** The AI noise remover's weights (assets/rnnoise.bin), loaded the first time they're needed. */
+    private val noiseModel by lazy {
+        com.pixelgo.editor.denoise.RnnModel(app.assets.open("rnnoise.bin").use { it.readBytes() })
+    }
+
+    /** Turns noise removal strength into a processing stage (runs on a background thread). */
+    private val denoiser: (channels: Int, strength: Float) -> com.pixelgo.editor.audiofx.Stage =
+        { ch, strength -> com.pixelgo.editor.denoise.DenoiseStage(ch, strength, noiseModel) }
+
+    private var previewPlayer: PreviewPlayer? = null
+    private var previewJob: Job? = null
+
+    /** What the noise cleanup preview is doing: null idle, false the original, true cleaned. */
+    var cleanupPreview by mutableStateOf<Boolean?>(null)
+        private set
+
+    /** The cleaned preview is being worked out (before it plays). */
+    var cleanupPreparing by mutableStateOf(false)
+        private set
+
+    /**
+     * Plays up to 5 s of clip [clipId] (or of the selection): the sound as it is, or with
+     * [strength] noise removal ([cleaned]), so the two can be compared before applying.
+     * Starts at the sound cursor if it's inside the clip.
+     */
+    fun previewCleanup(clipId: Long?, strength: Float, cleaned: Boolean) {
+        val e = engine ?: return
+        stopCleanupPreview()
+        stopPlaying()
+        val sel = soundSel
+        val c = clipId?.let { e.clip(it) }
+            ?: sel?.let { s -> clips().filter { it.trackId in s.tracks && it.startMs < s.toMs && it.endMs > s.fromMs }.minByOrNull { it.startMs } }
+            ?: return
+        val fromMs = when {
+            clipId == null && sel != null -> maxOf(sel.fromMs, c.startMs)
+            soundCursorMs() in c.startMs until c.endMs -> soundCursorMs()
+            else -> c.startMs
+        }
+        val toMs = minOf(fromMs + PREVIEW_MS, c.endMs, if (clipId == null && sel != null) sel.toMs else Long.MAX_VALUE)
+        val frames = ((toMs - fromMs) * FRAMES_PER_MS).toInt()
+        if (frames <= 0) return
+        val src0 = c.sourceMs(fromMs) * FRAMES_PER_MS
+        cleanupPreview = cleaned
+        cleanupPreparing = cleaned
+        previewJob = viewModelScope.launch {
+            try {
+                val (data, ch) = withContext(Dispatchers.Default) {
+                    PcmFile(pcmFile(c.assetId)).use { p ->
+                        val ch = p.channels.coerceIn(1, 2)
+                        val st = FloatArray(frames * 2)
+                        p.readStereo(src0, frames, st)
+                        val x = if (ch == 2) st else FloatArray(frames) { st[2 * it] }
+                        val y = if (!cleaned) x else FloatArray(frames * ch).also { result ->
+                            var at = 0
+                            val keep: (FloatArray, Int) -> Unit = { o, m ->
+                                System.arraycopy(o, 0, result, at, m * ch)
+                                at += m * ch
+                            }
+                            val stage = denoiser(ch, strength)
+                            stage.process(x, frames, keep)
+                            stage.flush(keep)
+                        }
+                        ShortArray(frames * ch) { (y[it] * 32767f).coerceIn(-32768f, 32767f).toInt().toShort() } to ch
+                    }
+                }
+                cleanupPreparing = false
+                val pcm = com.pixelgo.editor.MemoryPcm(data, ch)
+                val mixer = AudioMixer(
+                    listOf(com.pixelgo.model.SoundTrack(1, "preview")),
+                    listOf(com.pixelgo.model.AudioClip(1, 1, 1, 0, 0, toMs - fromMs, volume = c.volume)),
+                ) { pcm }
+                previewPlayer = PreviewPlayer(mixer, 0, frames.toLong(), loop = false).also { it.start() }
+                delay((toMs - fromMs) + 300)
+                previewPlayer?.stop()
+                previewPlayer = null
+                cleanupPreview = null
+            } catch (t: kotlinx.coroutines.CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                cleanupPreview = null
+                cleanupPreparing = false
+                toast("Can't preview: ${t.message ?: t.javaClass.simpleName}")
+            }
+        }
+    }
+
+    fun stopCleanupPreview() {
+        previewJob?.cancel()
+        previewJob = null
+        previewPlayer?.stop()
+        previewPlayer = null
+        cleanupPreview = null
+        cleanupPreparing = false
+    }
+
+    /**
+     * Renders [settings] into a new sound for clip [clipId], or for each piece of the selected
+     * section (split off first). In the background with progress; one undo step.
+     */
+    fun applyEffects(clipId: Long?, settings: com.pixelgo.editor.audiofx.EffectSettings) {
+        val e = engine ?: return
+        if (isBusy || settings.isNeutral) return
+        stopPlaying()
+        commitFloating()
+        val sel = soundSel
+        e.beginGroup()
+        val pieces = when {
+            clipId != null -> listOfNotNull(e.clip(clipId))
+            sel != null -> {
+                e.splitSection(sel.tracks, sel.fromMs, sel.toMs)
+                e.clipsInside(sel.tracks, sel.fromMs, sel.toMs)
+            }
+            else -> emptyList()
+        }
+        if (pieces.isEmpty()) {
+            e.cancelGroup()
+            changed(structure = true)
+            return toast("There's no sound to change there")
+        }
+        val jobs = pieces.map { it to e.newAssetId() }
+        val chainFor = { ch: Int -> com.pixelgo.editor.audiofx.Effects.chain(settings, ch, denoiser) }
+        busyLabel = if (settings.denoise > 0f) "Removing noise…" else "Applying effects…"
+        busyProgress = 0f
+        viewModelScope.launch {
+            try {
+                val made = withContext(Dispatchers.IO) {
+                    jobs.mapIndexed { idx, (c, newId) ->
+                        PcmFile(pcmFile(c.assetId)).use { src ->
+                            val ch = src.channels.coerceIn(1, 2)
+                            val w = com.pixelgo.data.audio.PcmWriter(pcmFile(newId), peaksFile(newId), ch)
+                            try {
+                                com.pixelgo.data.audio.SoundRender.process(
+                                    src, c.inMs * FRAMES_PER_MS, c.outMs * FRAMES_PER_MS, settings.reverse, chainFor(ch), w,
+                                    progress = { busyProgress = (idx + it) / jobs.size },
+                                )
+                            } finally {
+                                w.close()
+                            }
+                            Triple(c, newId, w.durationMs to ch)
+                        }
+                    }
+                }
+                for ((c, newId, info) in made) {
+                    val base = assetName(c.assetId).removeSuffix(" (edited)")
+                    e.addAsset(AudioAsset(newId, "$base (edited)", info.first, info.second))
+                    e.useProcessedSound(c.id, newId, info.first, settings.timeScale, settings.reverse)
+                }
+                e.endGroup()
+            } catch (t: Throwable) {
+                e.cancelGroup()
+                jobs.forEach { (_, id) -> pcmFile(id).delete(); peaksFile(id).delete() }
+                toast("Couldn't change the sound: ${t.message ?: t.javaClass.simpleName}")
+            } finally {
+                busyLabel = null
+                changed(structure = true)
+            }
+        }
+    }
+
+    /** Copies (or cuts) the selected section of each selected track to the sound clipboard. */
+    fun copySelection(cut: Boolean) {
+        val s = soundSel ?: return toast("Select a section first (Select tool, then drag)")
+        if (isBusy) return
+        stopPlaying()
+        val ts = tracks().filter { it.id in s.tracks }
+        val clipsNow = clips().toList()
+        val sources = AudioSources(app.projects.audioDir(projectId))
+        busyLabel = if (cut) "Cutting…" else "Copying…"
+        busyProgress = 0f
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    app.soundClipboard.write(ts.map { it.name }) { i, w ->
+                        val t = ts[i]
+                        // Clip volumes, fades and volume lines apply; the track's own volume doesn't.
+                        val mixer = AudioMixer(listOf(t.copy(volume = 1f, muted = false)), clipsNow.filter { it.trackId == t.id }) { sources.get(it) }
+                        com.pixelgo.data.audio.SoundRender.mix(mixer, s.fromMs * FRAMES_PER_MS, s.toMs * FRAMES_PER_MS, w)
+                    }
+                }
+                app.soundClipInfo = app.soundClipboard.info()
+                busyLabel = null
+                if (cut) deleteSelection(closeGap = false)
+                else toast("Copied ${"%.2f".format(java.util.Locale.US, (s.toMs - s.fromMs) / 1000.0)} s — paste it in any project")
+            } catch (t: Throwable) {
+                toast("Couldn't copy: ${t.message ?: t.javaClass.simpleName}")
+            } finally {
+                sources.close()
+                busyLabel = null
+            }
+        }
+    }
+
+    /**
+     * Pastes the sound clipboard at the selection's start (or the cursor), on the selected track
+     * and the ones below it (adding tracks if needed), over whatever sound is there. One undo step.
+     */
+    fun pasteSound() {
+        val info = app.soundClipboard.info() ?: return toast("Nothing copied yet: select a section, then Copy")
+        val e = engine ?: return
+        if (isBusy) return
+        stopPlaying()
+        val at = soundSel?.fromMs ?: soundCursorMs()
+        val ts = tracks()
+        val first = (soundSel?.let { s -> ts.indexOfFirst { it.id in s.tracks } } ?: ts.indexOfFirst { it.id == selectedTrackId }).coerceAtLeast(0)
+        val ids = info.tracks.map { e.newAssetId() }
+        busyLabel = "Pasting…"
+        busyProgress = 0f
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    info.tracks.forEachIndexed { i, t ->
+                        t.pcm.copyTo(pcmFile(ids[i]), overwrite = true)
+                        if (t.peaks.exists()) t.peaks.copyTo(peaksFile(ids[i]), overwrite = true)
+                    }
+                }
+                busyLabel = null
+                e.beginGroup()
+                val pieces = info.tracks.mapIndexed { i, t ->
+                    val trackId = tracks().getOrNull(first + i)?.id ?: e.addTrack(Names.unique(t.name, tracks().map { it.name })).id
+                    e.addAsset(AudioAsset(ids[i], "${t.name} (pasted)", t.durationMs, 2))
+                    com.pixelgo.model.AudioClip(0, trackId, ids[i], at, 0, t.durationMs)
+                }
+                e.placeOver(pieces)
+                e.endGroup()
+                soundSel = SoundSelection(pieces.map { it.trackId }.toSet(), at, at + info.lengthMs)
+                changed(structure = true)
+            } catch (t: Throwable) {
+                ids.forEach { pcmFile(it).delete(); peaksFile(it).delete() }
+                toast("Couldn't paste: ${t.message ?: t.javaClass.simpleName}")
+            } finally {
+                busyLabel = null
+            }
+        }
+    }
+
+    // ---- Punch-in --------------------------------------------------------------------------
+
+    /** The section being re-recorded (punch-in), if any. */
+    var punch by mutableStateOf<SoundSelection?>(null)
+        private set
+
+    /**
+     * Re-records the selected section of one track: plays from 2 s before it (after the
+     * count-in) while recording, stops by itself 1 s after it, and puts just that part of the
+     * take in place of the old sound (with short fades). One undo step.
+     */
+    fun startPunchIn(withCountIn: Boolean) {
+        val s = soundSel ?: return toast("Select the part to re-record first")
+        if (s.tracks.size != 1) return toast("Select a section on just one track to re-record it")
+        punch = s
+        startRecording(voiceOver = true, withCountIn = withCountIn, trackId = s.tracks.first(), fromMs = maxOf(0L, s.fromMs - PUNCH_PREROLL_MS))
+    }
+
+    /** Adds a volume-line point on the line at timeline time [atMs] (Volume tool). */
+    fun addVolumePoint(clipId: Long, atMs: Long) = audioOp { e ->
+        val c = e.clip(clipId) ?: return@audioOp
+        val src = c.sourceMs(atMs).coerceIn(c.inMs, c.outMs)
+        val gain = com.pixelgo.editor.ClipGain(c.copy(volume = 1f, fadeInMs = 0, fadeOutMs = 0)).atOffsetMs((src - c.inMs).toDouble())
+        val pts = (c.envelope.filter { it.atMs != src } + com.pixelgo.model.GainPoint(src, gain)).sortedBy { it.atMs }
+        e.changeClip(c.copy(envelope = pts))
+    }
+
+    fun removeVolumePoint(clipId: Long, atMs: Long) = audioOp { e ->
+        val c = e.clip(clipId) ?: return@audioOp
+        e.changeClip(c.copy(envelope = c.envelope.filter { it.atMs != atMs }))
+    }
+
+    /**
+     * Sets the clip's volume so its loudest moment is just under full scale (-1 dB), measured
+     * from the sound itself in the background.
+     */
+    fun normalizeClip(clipId: Long) {
+        val c = clips().firstOrNull { it.id == clipId } ?: return
+        viewModelScope.launch {
+            val peak = withContext(Dispatchers.IO) {
+                try {
+                    PcmFile(pcmFile(c.assetId)).use { p ->
+                        var m = 0f
+                        val chunk = 48_000
+                        val buf = FloatArray(chunk * 2)
+                        var f = c.inMs * FRAMES_PER_MS
+                        val end = c.outMs * FRAMES_PER_MS
+                        while (f < end) {
+                            val n = minOf(chunk.toLong(), end - f).toInt()
+                            p.readStereo(f, n, buf)
+                            for (i in 0 until n * 2) m = maxOf(m, abs(buf[i]))
+                            f += n
+                        }
+                        m
+                    }
+                } catch (_: Exception) {
+                    0f
+                }
+            }
+            if (peak < 1e-4f) return@launch toast("That clip is silent")
+            val target = 0.891f // -1 dB
+            changeClip(c.copy(volume = (target / peak).coerceAtMost(com.pixelgo.model.MAX_CLIP_VOLUME)))
+            if (target / peak > com.pixelgo.model.MAX_CLIP_VOLUME) toast("Very quiet: raised by the maximum (+12 dB)")
+        }
+    }
+
     private inline fun audioOp(op: (EditorEngine) -> Unit) {
         val e = engine ?: return
         if (isBusy) return
@@ -1391,6 +1814,12 @@ class EditorViewModel(private val app: PixelGoApp, private val projectId: String
     }
 
     companion object {
+        /** Re-recording a section plays this much before it, so you can come in on time. */
+        const val PUNCH_PREROLL_MS = 2_000L
+
+        /** How much the noise cleanup Before / After buttons play. */
+        const val PREVIEW_MS = 5_000L
+
         /** Nearest-neighbour downscale to at most 64 px on the long side (timeline thumbnails). */
         fun thumbBitmap(px: IntArray, w: Int, h: Int): ImageBitmap {
             val step = maxOf(1, (maxOf(w, h) + 63) / 64)

@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.LibraryAdd
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MusicNote
@@ -100,10 +101,14 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.pixelgo.data.audio.Peaks
+import com.pixelgo.editor.ClipGain
 import com.pixelgo.editor.FramePosition
 import com.pixelgo.editor.Timing
+import com.pixelgo.model.AUDIO_RATE
 import com.pixelgo.model.AudioClip
+import com.pixelgo.model.FRAMES_PER_MS
 import com.pixelgo.model.Frame
+import com.pixelgo.model.GainPoint
 import com.pixelgo.model.SoundTrack
 import com.pixelgo.ui.common.ConfirmDialog
 import com.pixelgo.ui.common.TextInputDialog
@@ -138,13 +143,20 @@ private const val MAX_VISIBLE_ROWS = 3
  * Only what's on screen is drawn, so thousands of frames and long sounds stay fast.
  */
 @Composable
-fun TimelineView(vm: EditorViewModel) {
-    var expanded by rememberSaveable { mutableStateOf(false) }
+fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
+    var expandedSetting by rememberSaveable { mutableStateOf(false) }
+    // Sound mode always shows the full timeline (it fills the screen).
+    val expanded = expandedSetting || vm.soundMode
     val dp = LocalDensity.current.density
     var zoom by remember { mutableFloatStateOf(44f * dp) } // screen px per tick
     var scroll by remember { mutableFloatStateOf(0f) }
     var vScroll by remember { mutableFloatStateOf(0f) }
     var viewWidth by remember { mutableIntStateOf(0) }
+    var viewHeight by remember { mutableIntStateOf(0) }
+    var showVolume by remember { mutableStateOf(false) }
+    var effectsFor by remember { mutableStateOf<Long?>(null) } // a clip id, or SELECTION
+    var cleanupFor by remember { mutableStateOf<Long?>(null) } // a clip id, or SELECTION
+    var showPunch by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showRecord by remember { mutableStateOf(false) }
     var holdTarget by remember { mutableIntStateOf(-2) } // -2 none, -1 range/current, >=0 frame
@@ -173,8 +185,18 @@ fun TimelineView(vm: EditorViewModel) {
     val audioEndMs = clips.maxOfOrNull { it.endMs } ?: 0L
     val total = max(animTicks, ceil(audioEndMs * fps / 1000.0).toLong())
     val minZoom = 2f * dp
-    val maxZoom = 140f * dp
+    // Sound mode zooms in to about 4 screen pixels per sample.
+    val maxZoom = if (vm.soundMode) 4f * AUDIO_RATE / fps else 140f * dp
     val endPad = 48f * dp
+
+    // Track rows: taller (and as many as fit) in sound mode; read live, gestures outlive compositions.
+    fun rowH(): Float = (if (vm.soundMode) vm.trackHeightDp else ROW_DP.toFloat()) * dp
+    fun rowsAreaH(): Float {
+        val all = vm.tracks().size * rowH()
+        return if (vm.soundMode) min(all, max(0f, viewHeight - (RULER_DP + FRAMES_DP + ADD_ROW_DP) * dp))
+        else min(vm.tracks().size, MAX_VISIBLE_ROWS) * rowH()
+    }
+    fun maxVScroll(): Float = max(0f, vm.tracks().size * rowH() - rowsAreaH())
 
     // Reads live values (gesture handlers outlive this composition).
     fun liveTotal(): Long {
@@ -219,6 +241,7 @@ fun TimelineView(vm: EditorViewModel) {
 
     val currentExpanded by rememberUpdatedState(expanded)
     val visibleRows = min(tracks.size, MAX_VISIBLE_ROWS)
+    LaunchedEffect(vm.soundMode, vm.trackHeightDp, tracks.size, viewHeight) { vScroll = vScroll.coerceIn(0f, maxVScroll()) }
 
     fun xToMs(x: Float): Long = (((x + scroll) / zoom) * 1000.0 / vm.fps).toLong()
     fun msToX(ms: Long): Float = (ms * vm.fps / 1000f) * zoom - scroll
@@ -238,11 +261,13 @@ fun TimelineView(vm: EditorViewModel) {
         val audioTop = rulerH + FRAMES_DP * dp
         if (y < audioTop) return Hit.Frames
         val ts = vm.tracks()
-        val rowsH = min(ts.size, MAX_VISIBLE_ROWS) * ROW_DP * dp
+        val rowsH = rowsAreaH()
         if (y >= audioTop + rowsH) return Hit.AddTrack
-        val row = floor((y - audioTop + vScroll) / (ROW_DP * dp)).toInt()
+        val row = floor((y - audioTop + vScroll) / rowH()).toInt()
         val track = ts.getOrNull(row) ?: return Hit.AddTrack
-        if (x < 72 * dp) return Hit.TrackLabel(track, y)
+        // The name chip (top-left of the row); in tall rows the space under it is track area.
+        val rowTop = audioTop + row * rowH() - vScroll
+        if (x < 72 * dp && y < rowTop + 4 * dp + min(rowH() - 8 * dp, 32 * dp) + 4 * dp) return Hit.TrackLabel(track, y)
         val ms = xToMs(x)
         val clip = vm.clips().lastOrNull { it.trackId == track.id && ms >= it.startMs && ms < it.endMs }
             ?: return Hit.TrackEmpty(track)
@@ -267,16 +292,71 @@ fun TimelineView(vm: EditorViewModel) {
         return ms
     }
 
+    // ---- Sound mode helpers (live values; gesture handlers outlive this composition) ----------
+
+    fun audioTop(): Float = (RULER_DP + FRAMES_DP) * dp
+
+    /** Top of the clip box in track row [ti], and its height. */
+    fun clipBox(ti: Int): Pair<Float, Float> = (audioTop() + ti * rowH() - vScroll + 3 * dp) to (rowH() - 6 * dp)
+
+    /** Snaps to frame starts and to clip edges within a few pixels. */
+    fun snapSoundMs(ms: Long): Long {
+        val edge = vm.clips().flatMap { listOf(it.startMs, it.endMs) }
+            .minByOrNull { abs(msToX(it) - msToX(ms)) }
+        if (edge != null && abs(msToX(edge) - msToX(ms)) < 6 * dp) return edge
+        return snapMs(ms)
+    }
+
+    /** Which row (track index) is at height [y], clamped to the tracks. */
+    fun rowAt(y: Float): Int = floor((y - audioTop() + vScroll) / rowH()).toInt().coerceIn(0, max(0, vm.tracks().size - 1))
+
+    /** Something in sound mode that a finger grabs directly: fade handles, volume-line points, selection edges. */
+    fun soundTarget(x: Float, y: Float): SoundTarget? {
+        if (!vm.soundMode || y < audioTop() || y >= audioTop() + rowsAreaH()) return null
+        val grab = 16 * dp
+        val ti = rowAt(y)
+        val track = vm.tracks().getOrNull(ti) ?: return null
+        val (cy0, ch) = clipBox(ti)
+        vm.soundSel?.let { s ->
+            if (track.id in s.tracks) {
+                if (abs(x - msToX(s.fromMs)) < grab) return SoundTarget.SelEdge(true)
+                if (abs(x - msToX(s.toMs)) < grab) return SoundTarget.SelEdge(false)
+            }
+        }
+        for (c in vm.clips().filter { it.trackId == track.id }) {
+            if (x < msToX(c.startMs) - grab || x > msToX(c.endMs) + grab) continue
+            when (vm.soundTool) {
+                SoundTool.Move -> if (y < cy0 + 22 * dp) {
+                    if (abs(x - msToX(c.startMs + c.fadeInMs)) < grab) return SoundTarget.Fade(c, true)
+                    if (abs(x - msToX(c.endMs - c.fadeOutMs)) < grab) return SoundTarget.Fade(c, false)
+                }
+                SoundTool.Volume -> for (pt in c.envelope) {
+                    val tMs = c.startMs + (pt.atMs - c.inMs)
+                    if (tMs < c.startMs || tMs > c.endMs) continue
+                    if (abs(x - msToX(tMs)) < grab && abs(y - gainToY(pt.gain, cy0, ch)) < grab) return SoundTarget.Point(c, pt)
+                }
+                SoundTool.Select -> Unit
+            }
+        }
+        return null
+    }
+
     val track: @Composable (Modifier) -> Unit = { modifier ->
         Box(
             modifier
-                .onSizeChanged { viewWidth = it.width }
+                .onSizeChanged {
+                    viewWidth = it.width
+                    viewHeight = it.height
+                }
                 .pointerInput(vm) {
                     var flingJob: Job? = null
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         flingJob?.cancel()
                         val startHit = hit(down.position.x, down.position.y)
+                        val target = soundTarget(down.position.x, down.position.y)
+                        val sound = vm.soundMode
+                        val tool = vm.soundTool
                         val slop = viewConfiguration.touchSlop
                         // 1 = tap, 2 = drag, 3 = pinch, null = long press
                         val kind = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
@@ -294,6 +374,104 @@ fun TimelineView(vm: EditorViewModel) {
                             k
                         }
                         when {
+                            // ---- Sound mode: taps and direct drags ------------------------------
+                            kind == 1 && sound && startHit !is Hit.TrackLabel && startHit != Hit.AddTrack -> {
+                                val x = down.position.x
+                                when (startHit) {
+                                    is Hit.Ruler -> vm.setCursor(snapSoundMs(xToMs(x)))
+                                    is Hit.Frames -> frameAtX(x)?.let { fi ->
+                                        if (vm.rangeMode) vm.tapFrameInRange(fi) else vm.selectFrame(fi)
+                                    }
+                                    is Hit.OnClip -> {
+                                        vm.selectedTrackId = startHit.clip.trackId
+                                        when (tool) {
+                                            SoundTool.Move -> {
+                                                vm.setCursor(xToMs(x))
+                                                vm.selectedClipId = startHit.clip.id
+                                            }
+                                            SoundTool.Volume -> vm.addVolumePoint(startHit.clip.id, xToMs(x))
+                                            SoundTool.Select -> {
+                                                vm.soundSel = null
+                                                vm.setCursor(snapSoundMs(xToMs(x)))
+                                            }
+                                        }
+                                    }
+                                    is Hit.TrackEmpty -> {
+                                        vm.selectedTrackId = startHit.track.id
+                                        vm.soundSel = null
+                                        vm.setCursor(snapSoundMs(xToMs(x)))
+                                    }
+                                    else -> Unit
+                                }
+                            }
+                            kind == null && target is SoundTarget.Point -> {
+                                // Long-press a volume point: remove it.
+                                vm.removeVolumePoint(target.clip.id, target.point.atMs)
+                                do {
+                                    val ev = awaitPointerEvent()
+                                    ev.changes.forEach { it.consume() }
+                                } while (ev.changes.any { it.pressed })
+                            }
+                            kind == 2 && target != null -> {
+                                // Drag a fade handle, a volume point or a selection edge.
+                                val selAtStart = vm.soundSel
+                                var moved = false
+                                do {
+                                    val ev = awaitPointerEvent()
+                                    val c = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                    if (c.pressed) {
+                                        val ms = xToMs(c.position.x)
+                                        when (target) {
+                                            is SoundTarget.Fade -> {
+                                                val o = target.clip
+                                                vm.moveClipLive(
+                                                    if (target.fadeIn) o.copy(fadeInMs = (ms - o.startMs).coerceIn(0L, o.durationMs - o.fadeOutMs))
+                                                    else o.copy(fadeOutMs = (o.endMs - ms).coerceIn(0L, o.durationMs - o.fadeInMs)),
+                                                )
+                                            }
+                                            is SoundTarget.Point -> {
+                                                val o = target.clip
+                                                val ti = vm.tracks().indexOfFirst { it.id == o.trackId }
+                                                val (cy0, ch) = clipBox(ti)
+                                                val others = o.envelope.filter { it != target.point }
+                                                val lo = (others.filter { it.atMs < target.point.atMs }.maxOfOrNull { it.atMs } ?: (o.inMs - 1)) + 1
+                                                val hi = (others.filter { it.atMs > target.point.atMs }.minOfOrNull { it.atMs } ?: (o.outMs + 1)) - 1
+                                                val at = o.sourceMs(ms).coerceIn(lo, max(lo, hi))
+                                                vm.moveClipLive(o.copy(envelope = (others + GainPoint(at, yToGain(c.position.y, cy0, ch))).sortedBy { it.atMs }))
+                                            }
+                                            is SoundTarget.SelEdge -> selAtStart?.let { s ->
+                                                val snapped = snapSoundMs(ms)
+                                                vm.soundSel = if (target.start) s.copy(fromMs = min(snapped, s.toMs - 1))
+                                                else s.copy(toMs = max(snapped, s.fromMs + 1))
+                                            }
+                                        }
+                                        moved = true
+                                    }
+                                    ev.changes.forEach { it.consume() }
+                                } while (ev.changes.any { it.pressed })
+                                if (moved) when (target) {
+                                    is SoundTarget.Fade -> vm.finishClipDrag(target.clip)
+                                    is SoundTarget.Point -> vm.finishClipDrag(target.clip)
+                                    is SoundTarget.SelEdge -> Unit
+                                }
+                            }
+                            kind == 2 && sound && tool == SoundTool.Select && (startHit is Hit.OnClip || startHit is Hit.TrackEmpty) -> {
+                                // Select tool: drag across tracks to select a section.
+                                val fromMs = snapSoundMs(xToMs(down.position.x))
+                                val r0 = rowAt(down.position.y)
+                                do {
+                                    val ev = awaitPointerEvent()
+                                    val c = ev.changes.firstOrNull { it.id == down.id } ?: break
+                                    if (c.pressed) {
+                                        val ms = snapSoundMs(xToMs(c.position.x)).coerceAtLeast(0)
+                                        val r1 = rowAt(c.position.y)
+                                        val ts = vm.tracks()
+                                        val ids = (min(r0, r1)..max(r0, r1)).mapNotNull { ts.getOrNull(it)?.id }.toSet()
+                                        vm.soundSel = if (ms != fromMs && ids.isNotEmpty()) SoundSelection(ids, min(fromMs, ms), max(fromMs, ms)) else null
+                                    }
+                                    ev.changes.forEach { it.consume() }
+                                } while (ev.changes.any { it.pressed })
+                            }
                             kind == 1 -> when (startHit) {
                                 is Hit.Ruler, is Hit.Frames -> frameAtX(down.position.x)?.let { fi ->
                                     if (vm.rangeMode && startHit is Hit.Frames) vm.tapFrameInRange(fi) else vm.selectFrame(fi)
@@ -310,7 +488,7 @@ fun TimelineView(vm: EditorViewModel) {
                                 is Hit.TrackEmpty -> vm.selectedTrackId = startHit.track.id
                                 Hit.AddTrack -> vm.addTrack()
                             }
-                            kind == null && startHit is Hit.OnClip -> {
+                            kind == null && startHit is Hit.OnClip && (!sound || tool == SoundTool.Move) -> {
                                 // Long-press on a clip: drag to move (or trim at its edges).
                                 val original = startHit.clip
                                 val assetMs = vm.assetDurationMs(original.assetId)
@@ -370,17 +548,31 @@ fun TimelineView(vm: EditorViewModel) {
                                 val inAudio = startHit !is Hit.Ruler && startHit !is Hit.Frames
                                 var vertical: Boolean? = null
                                 var pinching = false
+                                var pinchHeight: Boolean? = null // sound mode: fingers one above the other
                                 do {
                                     val ev = awaitPointerEvent()
                                     val pressed = ev.changes.filter { it.pressed }
                                     if (pressed.size >= 2) {
                                         pinching = true
-                                        val z = ev.calculateZoom()
-                                        val cx = ev.calculateCentroid().x
-                                        val newZoom = (zoom * z).coerceIn(minZoom, maxZoom)
-                                        val tickAtFinger = (cx + scroll) / zoom
-                                        zoom = newZoom
-                                        scroll = clampScroll(tickAtFinger * newZoom - cx)
+                                        val p0 = pressed[0]
+                                        val p1 = pressed[1]
+                                        if (pinchHeight == null) {
+                                            pinchHeight = vm.soundMode && inAudio &&
+                                                abs(p0.position.y - p1.position.y) > abs(p0.position.x - p1.position.x)
+                                        }
+                                        if (pinchHeight == true) {
+                                            // Taller / shorter tracks.
+                                            val before = abs(p0.previousPosition.y - p1.previousPosition.y)
+                                            val now = abs(p0.position.y - p1.position.y)
+                                            if (before > 8 * dp) vm.setTrackHeight(vm.trackHeightDp * now / before)
+                                        } else {
+                                            val z = ev.calculateZoom()
+                                            val cx = ev.calculateCentroid().x
+                                            val newZoom = (zoom * z).coerceIn(minZoom, maxZoom)
+                                            val tickAtFinger = (cx + scroll) / zoom
+                                            zoom = newZoom
+                                            scroll = clampScroll(tickAtFinger * newZoom - cx)
+                                        }
                                     } else if (pressed.size == 1 && !pinching) {
                                         val c = pressed[0]
                                         val dx = c.position.x - c.previousPosition.x
@@ -392,10 +584,7 @@ fun TimelineView(vm: EditorViewModel) {
                                         }
                                         when {
                                             scrubbing -> frameAtX(c.position.x.coerceAtLeast(0f))?.let { vm.selectFrame(it) }
-                                            vertical == true -> {
-                                                val maxV = max(0f, (vm.tracks().size - MAX_VISIBLE_ROWS) * ROW_DP * dp)
-                                                vScroll = (vScroll - dy).coerceIn(0f, maxV)
-                                            }
+                                            vertical == true -> vScroll = (vScroll - dy).coerceIn(0f, maxVScroll())
                                             else -> {
                                                 scroll = clampScroll(scroll - dx)
                                                 velocity.addPosition(c.uptimeMillis, c.position)
@@ -436,8 +625,8 @@ fun TimelineView(vm: EditorViewModel) {
                 if (expanded) {
                     drawAudio(
                         vm = vm, tracks = tracks, clips = clips, zoom = zoom, scroll = scroll,
-                        vScroll = vScroll, top = (RULER_DP + FRAMES_DP) * density, colors = colors,
-                        measurer = textMeasurer, animTicks = animTicks, totalTicks = total,
+                        vScroll = vScroll, top = (RULER_DP + FRAMES_DP) * density, rowH = rowH(), rowsH = rowsAreaH(),
+                        colors = colors, measurer = textMeasurer, animTicks = animTicks, totalTicks = total,
                     )
                 }
             }
@@ -482,8 +671,32 @@ fun TimelineView(vm: EditorViewModel) {
         }
     }
 
-    Column(Modifier.fillMaxWidth()) {
-        if (expanded) {
+    Column(modifier.fillMaxWidth()) {
+        if (vm.soundMode) {
+            SoundModeHeader(
+                vm,
+                onRecord = { showRecord = true },
+                onImport = { importLauncher.launch(arrayOf("audio/*", "video/*")) },
+                onSettings = { showSettings = true },
+                canPaste = vm.canPasteSound,
+            )
+            SoundToolsRow(vm, onZoom = { factor ->
+                // Zoom around the cursor (kept where it is on screen).
+                val anchor = msToX(vm.soundCursorMs()).coerceIn(0f, viewWidth.toFloat())
+                val tickAt = (anchor + scroll) / zoom
+                val nz = (zoom * factor).coerceIn(minZoom, maxZoom)
+                zoom = nz
+                scroll = clampScroll(tickAt * nz - anchor)
+            })
+            if (vm.soundSel != null) {
+                SoundSelectionBar(
+                    vm, onVolume = { showVolume = true }, onEffects = { effectsFor = SELECTION }, onCleanup = { cleanupFor = SELECTION },
+                    onReRecord = { showPunch = true }, canPaste = vm.canPasteSound,
+                )
+            }
+            if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 }, onDelete = { confirmDelete = true })
+            track(Modifier.fillMaxWidth().weight(1f))
+        } else if (expanded) {
             Row(
                 Modifier.fillMaxWidth().height(44.dp).padding(horizontal = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -495,17 +708,20 @@ fun TimelineView(vm: EditorViewModel) {
                     Text(Timing.formatMs(ms), style = MaterialTheme.typography.labelMedium, maxLines = 1)
                     Text("${follow + 1} / ${vm.frameCount}", style = MaterialTheme.typography.labelSmall, maxLines = 1)
                 }
-                SmallIconButton(Icons.Filled.ViewWeek, "Select frames", selected = vm.rangeMode, onClick = vm::toggleRangeMode)
-                SmallIconButton(Icons.Filled.Add, "Add blank frame", onClick = { vm.addFrame(FramePosition.AFTER) })
+                val s = 36.dp
+                SmallIconButton(Icons.Filled.ViewWeek, "Select frames", selected = vm.rangeMode, size = s, onClick = vm::toggleRangeMode)
+                SmallIconButton(Icons.Filled.Add, "Add blank frame", size = s, onClick = { vm.addFrame(FramePosition.AFTER) })
                 SmallIconButton(
                     Icons.Filled.LibraryAdd,
                     if (vm.duplicateToEnd) "Duplicate frame to end" else "Duplicate frame",
+                    size = s,
                     onClick = { vm.duplicateFrame() },
                 )
-                SmallIconButton(Icons.Filled.Mic, "Record sound", onClick = { showRecord = true })
-                SmallIconButton(Icons.Filled.MusicNote, "Import sound", onClick = { importLauncher.launch(arrayOf("audio/*", "video/*")) })
-                SmallIconButton(Icons.Filled.Tune, "Animation settings", onClick = { showSettings = true })
-                SmallIconButton(Icons.Filled.ExpandMore, "Smaller timeline", onClick = { expanded = false })
+                SmallIconButton(Icons.Filled.Mic, "Record sound", size = s, onClick = { showRecord = true })
+                SmallIconButton(Icons.Filled.MusicNote, "Import sound", size = s, onClick = { importLauncher.launch(arrayOf("audio/*", "video/*")) })
+                SmallIconButton(Icons.Filled.GraphicEq, "Sound mode (full screen)", size = s, onClick = { vm.enterSoundMode(true) })
+                SmallIconButton(Icons.Filled.Tune, "Animation settings", size = s, onClick = { showSettings = true })
+                SmallIconButton(Icons.Filled.ExpandMore, "Smaller timeline", size = s, onClick = { expandedSetting = false })
             }
             if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 }, onDelete = { confirmDelete = true })
             val audioDp = visibleRows * ROW_DP + ADD_ROW_DP
@@ -524,15 +740,33 @@ fun TimelineView(vm: EditorViewModel) {
                     if (vm.duplicateToEnd) "Duplicate frame to end" else "Duplicate frame",
                     onClick = { vm.duplicateFrame() },
                 )
-                SmallIconButton(Icons.Filled.ExpandLess, "Bigger timeline (with sound)", onClick = { expanded = true })
+                SmallIconButton(Icons.Filled.ExpandLess, "Bigger timeline (with sound)", onClick = { expandedSetting = true })
             }
+        }
+    }
+
+    if (showVolume) {
+        VolumeDialog("Selection volume", 1f, onDismiss = { showVolume = false }) {
+            showVolume = false
+            vm.setSelectionVolume(it)
         }
     }
 
     if (showSettings) AnimationSettingsDialog(vm, onDismiss = { showSettings = false })
     if (showRecord) RecordSheet(vm, onDismiss = { showRecord = false })
+    if (showPunch) RecordSheet(vm, onDismiss = { showPunch = false }, punchIn = true)
+    effectsFor?.let { target -> EffectsSheet(vm, if (target == SELECTION) null else target, onDismiss = { effectsFor = null }) }
+    cleanupFor?.let { target -> CleanupSheet(vm, if (target == SELECTION) null else target, onDismiss = { cleanupFor = null }) }
     vm.selectedClipId?.let { id ->
-        if (clips.any { it.id == id }) ClipSheet(vm, id, onDismiss = { vm.selectedClipId = null })
+        if (clips.any { it.id == id }) {
+            ClipSheet(vm, id, onDismiss = { vm.selectedClipId = null }, onEffects = {
+                vm.selectedClipId = null
+                effectsFor = id
+            }, onCleanup = {
+                vm.selectedClipId = null
+                cleanupFor = id
+            })
+        }
     }
     if (holdTarget > -2) {
         val target = holdTarget
@@ -592,6 +826,20 @@ private sealed interface Hit {
 }
 
 private enum class ClipPart { Start, Body, End }
+
+/** [effectsFor] value meaning "the selected section". */
+private const val SELECTION = -1L
+
+/** Things a finger grabs directly in sound mode. */
+private sealed interface SoundTarget {
+    data class Fade(val clip: AudioClip, val fadeIn: Boolean) : SoundTarget
+    data class Point(val clip: AudioClip, val point: GainPoint) : SoundTarget
+    data class SelEdge(val start: Boolean) : SoundTarget
+}
+
+/** Volume line height: gain 0 at the bottom of the clip box, 2 (+6 dB) at the top. */
+private fun gainToY(g: Float, top: Float, h: Float) = top + h - (g / 2f).coerceIn(0f, 1f) * h
+private fun yToGain(y: Float, top: Float, h: Float) = (2f * (top + h - y) / h).coerceIn(0f, 2f)
 
 private class TimelineColors(
     val background: Color,
@@ -686,10 +934,12 @@ private fun DrawScope.drawTimeline(
         drawRect(colors.ruler, Offset.Zero, Size(size.width, rulerH))
         // Pick a label step that leaves ~64dp between labels.
         val fps = vm.fps
-        val candidates = doubleArrayOf(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0)
+        val candidates = doubleArrayOf(
+            0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0,
+        )
         val minTicks = (64 * dp) / zoom
         val stepSec = candidates.firstOrNull { it * fps >= minTicks } ?: 3600.0
-        val stepTicks = max(1.0, stepSec * fps)
+        val stepTicks = stepSec * fps // may be less than a frame when zoomed in on sound
         var k = ceil((scroll / zoom) / stepTicks).toLong()
         val rulerStyle = TextStyle(color = colors.text, fontSize = 9.sp)
         while (true) {
@@ -699,6 +949,7 @@ private fun DrawScope.drawTimeline(
             drawLine(colors.text.copy(alpha = 0.5f), Offset(x, rulerH - 6 * dp), Offset(x, rulerH), 1 * dp)
             val secs = tick / fps
             val text = if (secs >= 60) "%d:%02d".format((secs / 60).toInt(), (secs % 60).toInt())
+            else if (stepSec < 0.01) "%.3fs".format(secs)
             else if (stepSec < 1) "%.2fs".format(secs) else "%.0fs".format(secs)
             drawText(measurer.measure(text, rulerStyle), topLeft = Offset(x + 2 * dp, 2 * dp))
             k++
@@ -706,7 +957,11 @@ private fun DrawScope.drawTimeline(
     }
 }
 
-/** Sound tracks: label chips, clips with waveforms, the add-track row and the playhead. */
+/**
+ * Sound tracks: label chips, clips with waveforms, the add-track row and the playhead. In sound
+ * mode also fades (shading + handles), volume lines, the selection and the cursor; zoomed in
+ * closer than the 10 ms peaks, the waveform comes from the samples themselves.
+ */
 private fun DrawScope.drawAudio(
     vm: EditorViewModel,
     tracks: List<SoundTrack>,
@@ -715,18 +970,25 @@ private fun DrawScope.drawAudio(
     scroll: Float,
     vScroll: Float,
     top: Float,
+    rowH: Float,
+    rowsH: Float,
     colors: TimelineColors,
     measurer: TextMeasurer,
     animTicks: Long,
     totalTicks: Long,
 ) {
     val dp = density
-    val rowH = ROW_DP * dp
-    val rowsH = min(tracks.size, MAX_VISIBLE_ROWS) * rowH
     val fps = vm.fps
+    val sound = vm.soundMode
+    val tool = vm.soundTool
     fun msToX(ms: Long) = (ms * fps / 1000f) * zoom - scroll
+    val msPerPx = 1000.0 / fps / zoom
     val nameStyle = TextStyle(color = Color.White, fontSize = 9.sp)
     val labelStyle = TextStyle(color = colors.text, fontSize = 10.sp)
+    val gains = ClipGain.all(tracks, clips, withTrackVolume = false)
+    val scale = if (sound) vm.waveScale.toFloat() else 1f
+    val mm = FloatArray(2)
+    vm.waveTick // redraw when zoomed-in samples have loaded
 
     clipRect(0f, top, size.width, top + rowsH) {
         tracks.forEachIndexed { ti, t ->
@@ -745,21 +1007,106 @@ private fun DrawScope.drawAudio(
                 if (x1 < 0 || x0 > size.width) continue
                 val cy0 = y0 + 3 * dp
                 val ch = rowH - 6 * dp
+                val mid = cy0 + ch / 2
+                val half = ch / 2
                 drawRoundRect(color.copy(alpha = color.alpha * 0.45f), Offset(x0, cy0), Size(x1 - x0, ch), CornerRadius(4 * dp))
-                // Waveform for the visible part of the clip.
-                val peaks = vm.peaks(c.assetId)
-                if (peaks != null && peaks.isNotEmpty()) {
-                    val step = 2 * dp
-                    var x = max(x0, 0f)
-                    val end = min(x1, size.width)
-                    val mid = cy0 + ch / 2
-                    val msPerPx = 1000f / fps / zoom
-                    while (x < end) {
-                        val srcMs = c.inMs + ((x - x0) * msPerPx).toLong()
-                        val lvl = Peaks.level(peaks, srcMs, srcMs + (step * msPerPx).toLong() + 1) * c.volume
-                        val half = (lvl.coerceAtMost(1f) * ch / 2).coerceAtLeast(0.5f * dp)
-                        drawLine(color, Offset(x, mid - half), Offset(x, mid + half), 1.2f * dp)
-                        x += step
+                val g = gains[c.id]
+                fun gainAt(offMs: Double) = (g?.atOffsetMs(offMs) ?: c.volume) * scale
+                fun column(x: Float, lo: Float, hi: Float, width: Float) {
+                    val yTop = mid - hi.coerceIn(-1f, 1f) * half
+                    val yBot = max(mid - lo.coerceIn(-1f, 1f) * half, yTop + 0.8f * dp)
+                    drawLine(color, Offset(x, yTop), Offset(x, yBot), width)
+                }
+                val startX = max(x0, 0f)
+                val endX = min(x1, size.width)
+                val stepPx = 2 * dp
+                if (!sound || msPerPx * stepPx >= 20) {
+                    // 10 ms peaks.
+                    val peaks = vm.peaks(c.assetId)
+                    if (peaks != null && peaks.isNotEmpty()) {
+                        var x = startX
+                        while (x < endX) {
+                            val off = (x - x0) * msPerPx
+                            val src = c.inMs + off.toLong()
+                            Peaks.minMax(peaks, src, src + (stepPx * msPerPx).toLong() + 1, mm)
+                            val gn = gainAt(off)
+                            column(x, mm[0] * gn, mm[1] * gn, 1.2f * dp)
+                            x += stepPx
+                        }
+                    }
+                } else {
+                    val framesPerPx = msPerPx * FRAMES_PER_MS
+                    val inF = c.inMs * FRAMES_PER_MS
+                    if (framesPerPx > 1.5) {
+                        // The lowest / highest sample under each pixel column.
+                        var x = floor(startX)
+                        while (x < endX) {
+                            val off = (x - x0) * msPerPx
+                            val f0 = inF + (off * FRAMES_PER_MS).toLong()
+                            if (vm.waveforms.minMax(c.assetId, f0, f0 + ceil(framesPerPx).toLong(), mm)) {
+                                val gn = gainAt(off)
+                                column(x, mm[0] * gn, mm[1] * gn, 1f)
+                            }
+                            x += 1f
+                        }
+                    } else {
+                        // Each sample is wider than a pixel: draw the line through the samples.
+                        val pxPerFrame = (1.0 / framesPerPx).toFloat()
+                        val first = max(inF, inF + ((startX - x0) * framesPerPx).toLong() - 1)
+                        val last = min(c.outMs * FRAMES_PER_MS - 1, inF + ((endX - x0) * framesPerPx).toLong() + 1)
+                        var prev: Offset? = null
+                        for (f in first..last) {
+                            val v = vm.waveforms.sample(c.assetId, f)
+                            if (v == null) {
+                                prev = null
+                                continue
+                            }
+                            val off = (f - inF).toDouble() / FRAMES_PER_MS
+                            val p = Offset(x0 + (f - inF) * pxPerFrame, mid - (v * gainAt(off)).coerceIn(-1f, 1f) * half)
+                            prev?.let { drawLine(color, it, p, 1.5f * dp) }
+                            if (pxPerFrame > 6 * dp) drawCircle(color, 2 * dp, p)
+                            prev = p
+                        }
+                    }
+                }
+                if (sound) {
+                    // Fades: shaded corners, with handles to drag (Move tool).
+                    val shade = Color(0x66000000)
+                    val fi = msToX(c.startMs + c.fadeInMs)
+                    val fo = msToX(c.endMs - c.fadeOutMs)
+                    if (c.fadeInMs > 0) drawFadeShade(x0, fi, cy0, ch, rising = true, shade)
+                    if (c.fadeOutMs > 0) drawFadeShade(fo, x1, cy0, ch, rising = false, shade)
+                    if (tool == SoundTool.Move && ch >= 30 * dp) {
+                        for (hx in listOf(fi, fo)) {
+                            drawRect(Color.White, Offset(hx - 4 * dp, cy0), Size(8 * dp, 8 * dp))
+                            drawRect(Color.Black, Offset(hx - 4 * dp, cy0), Size(8 * dp, 8 * dp), style = Stroke(1 * dp))
+                        }
+                    }
+                    // Volume line (always shown once it's used; editable with the Volume tool).
+                    if (c.envelope.isNotEmpty() || tool == SoundTool.Volume) {
+                        val line = ClipGain(c.copy(volume = 1f, fadeInMs = 0, fadeOutMs = 0))
+                        val lineColor = if (tool == SoundTool.Volume) Color.White else Color.White.copy(alpha = 0.6f)
+                        var px = startX
+                        var py = gainToY(line.atOffsetMs((startX - x0) * msPerPx), cy0, ch)
+                        var x = startX + 4 * dp
+                        while (true) {
+                            val xx = min(x, endX)
+                            val gy = gainToY(line.atOffsetMs((xx - x0) * msPerPx), cy0, ch)
+                            drawLine(lineColor, Offset(px, py), Offset(xx, gy), 1.5f * dp)
+                            px = xx
+                            py = gy
+                            if (xx >= endX) break
+                            x += 4 * dp
+                        }
+                        if (tool == SoundTool.Volume) {
+                            for (pt in c.envelope) {
+                                val tMs = c.startMs + (pt.atMs - c.inMs)
+                                if (tMs < c.startMs || tMs > c.endMs) continue
+                                val p = Offset(msToX(tMs), gainToY(pt.gain, cy0, ch))
+                                drawCircle(Color.White, 5 * dp, p)
+                                drawCircle(color, 3 * dp, p)
+                            }
+                        }
                     }
                 }
                 if (x1 - x0 > 40 * dp) {
@@ -772,12 +1119,27 @@ private fun DrawScope.drawAudio(
             }
             // Track name chip (fixed at the left edge).
             val label = measurer.measure((if (t.muted) "🔇 " else "") + t.name.take(10), labelStyle)
+            val chipH = min(rowH - 8 * dp, 32 * dp)
             drawRoundRect(
                 Color(0xCC1E1E24), Offset(2 * dp, y0 + 4 * dp),
-                Size(min(label.size.width + 10 * dp, 70 * dp), rowH - 8 * dp), CornerRadius(6 * dp),
+                Size(min(label.size.width + 10 * dp, 70 * dp), chipH), CornerRadius(6 * dp),
             )
             clipRect(2 * dp, y0, 70 * dp, y0 + rowH) {
-                drawText(label, topLeft = Offset(7 * dp, y0 + (rowH - label.size.height) / 2))
+                drawText(label, topLeft = Offset(7 * dp, y0 + 4 * dp + (chipH - label.size.height) / 2))
+            }
+        }
+        // The selected section.
+        vm.soundSel?.let { s ->
+            val sx0 = msToX(s.fromMs)
+            val sx1 = msToX(s.toMs)
+            tracks.forEachIndexed { ti, t ->
+                if (t.id !in s.tracks) return@forEachIndexed
+                val y0 = top + ti * rowH - vScroll
+                drawRect(Color(0x553DD6A0), Offset(sx0, y0), Size(sx1 - sx0, rowH))
+                for (ex in listOf(sx0, sx1)) {
+                    drawLine(Color(0xFF3DD6A0), Offset(ex, y0), Offset(ex, y0 + rowH), 2 * dp)
+                    drawCircle(Color(0xFF3DD6A0), 6 * dp, Offset(ex, y0 + rowH / 2))
+                }
             }
         }
     }
@@ -797,21 +1159,43 @@ private fun DrawScope.drawAudio(
         measurer.measure(if (tracks.isEmpty()) "＋ Add a sound track (or use 🎤 / ♫ above)" else "＋ Add track", labelStyle),
         topLeft = Offset(8 * dp, addTop + 6 * dp),
     )
-    // Playhead through everything: where the sound is while playing, else the current frame.
+    // Playhead through everything: where the sound is while playing, else the cursor / current frame.
     val timing = vm.timing()
-    val headTick = when {
-        vm.isPlaying -> vm.playTick
-        timing != null && vm.frameIndex in 0 until timing.frameCount -> timing.startTick(vm.frameIndex)
+    val headX: Float? = when {
+        vm.isPlaying -> vm.playTick * zoom - scroll
+        sound -> msToX(vm.soundCursorMs())
+        timing != null && vm.frameIndex in 0 until timing.frameCount -> timing.startTick(vm.frameIndex) * zoom - scroll
         else -> null
     }
-    if (headTick != null) {
-        val px = headTick * zoom - scroll
-        drawLine(colors.primary, Offset(px, 0f), Offset(px, size.height), 2 * dp)
+    if (headX != null) drawLine(colors.primary, Offset(headX, 0f), Offset(headX, size.height), 2 * dp)
+}
+
+/** A fade drawn as a shaded triangle over the clip (the part that's quieter). */
+private fun DrawScope.drawFadeShade(xa: Float, xb: Float, top: Float, h: Float, rising: Boolean, color: Color) {
+    if (xb - xa < 1f) return
+    val path = androidx.compose.ui.graphics.Path().apply {
+        if (rising) {
+            moveTo(xa, top)
+            lineTo(xb, top)
+            lineTo(xa, top + h)
+        } else {
+            moveTo(xa, top)
+            lineTo(xb, top)
+            lineTo(xb, top + h)
+        }
+        close()
     }
+    drawPath(path, color)
+    drawLine(
+        Color.White.copy(alpha = 0.7f),
+        if (rising) Offset(xa, top + h) else Offset(xa, top),
+        if (rising) Offset(xb, top) else Offset(xb, top + h),
+        1f * density,
+    )
 }
 
 @Composable
-private fun PlayButton(vm: EditorViewModel) {
+internal fun PlayButton(vm: EditorViewModel) {
     SmallIconButton(
         if (vm.isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow,
         if (vm.isPlaying) "Stop" else "Play",
@@ -939,12 +1323,13 @@ fun SmallIconButton(
     label: String,
     enabled: Boolean = true,
     selected: Boolean = false,
+    size: androidx.compose.ui.unit.Dp = 40.dp,
     onClick: () -> Unit,
 ) {
     IconButton(
         onClick = onClick,
         enabled = enabled,
-        modifier = Modifier.size(40.dp),
+        modifier = Modifier.size(size),
         colors = if (selected) IconButtonDefaults.filledIconButtonColors() else IconButtonDefaults.iconButtonColors(),
     ) { Icon(icon, label, Modifier.size(22.dp)) }
 }

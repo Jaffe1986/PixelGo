@@ -340,8 +340,33 @@ class History(private val limit: Int = 100) {
     val canUndo get() = undoStack.isNotEmpty()
     val canRedo get() = redoStack.isNotEmpty()
 
+    /** Edits collected since [beginGroup], recorded as one step by [endGroup]. */
+    private var group: MutableList<Edit>? = null
+
+    /** From now on, edits are collected into one undo step (until [endGroup] / [cancelGroup]). */
+    fun beginGroup() {
+        if (group == null) group = ArrayList()
+    }
+
+    fun endGroup() {
+        val g = group ?: return
+        group = null
+        if (g.isNotEmpty()) push(if (g.size == 1) g[0] else CompoundEdit(g))
+    }
+
+    /** Takes back everything done since [beginGroup] and forgets it. */
+    fun cancelGroup(p: PixelProject, s: CelStore) {
+        val g = group ?: return
+        group = null
+        g.asReversed().forEach { it.undo(p, s) }
+    }
+
     /** Records an edit that has already been applied. */
     fun push(edit: Edit) {
+        group?.let {
+            it += edit
+            return
+        }
         undoStack.addLast(edit)
         if (undoStack.size > limit) undoStack.removeFirst()
         redoStack.clear()
@@ -365,11 +390,13 @@ class History(private val limit: Int = 100) {
     fun collectRefs(layers: MutableSet<Long>, frames: MutableSet<Long>) {
         undoStack.forEach { it.collectRefs(layers, frames) }
         redoStack.forEach { it.collectRefs(layers, frames) }
+        group?.forEach { it.collectRefs(layers, frames) }
     }
 
     /** Every audio asset id that undo or redo could bring back. */
     fun collectAssetRefs(assets: MutableSet<Long>) {
         undoStack.forEach { it.collectAssetRefs(assets) }
         redoStack.forEach { it.collectAssetRefs(assets) }
+        group?.forEach { it.collectAssetRefs(assets) }
     }
 }

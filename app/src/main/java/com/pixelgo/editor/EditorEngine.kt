@@ -3,11 +3,14 @@ package com.pixelgo.editor
 import com.pixelgo.model.AudioAsset
 import com.pixelgo.model.AudioClip
 import com.pixelgo.model.Frame
+import com.pixelgo.model.GainPoint
 import com.pixelgo.model.Layer
 import com.pixelgo.model.SoundTrack
+import com.pixelgo.model.MAX_CLIP_VOLUME
 import com.pixelgo.model.MAX_HOLD
 import com.pixelgo.model.MAX_LAYERS
 import com.pixelgo.model.PixelProject
+import kotlin.math.abs
 
 /** Where a new frame goes, relative to the current one. */
 enum class FramePosition { BEFORE, AFTER, END }
@@ -780,10 +783,6 @@ class EditorEngine(val project: PixelProject, val store: CelStore) {
     }
 
     /**
-     * Places a whole asset at [startMs] on track [trackId], or on a new track called
-     * [newTrackName] when [trackId] is null/unknown. One undo step.
-     */
-    /**
      * Places a sound on a track (a new track named [newTrackName] if [trackId] is null or gone).
      * [inMs] skips the start of the sound (e.g. a recording's count-in). Returns null if nothing
      * of the sound would be left.
@@ -845,17 +844,28 @@ class EditorEngine(val project: PixelProject, val store: CelStore) {
 
     /** Cuts a clip in two at [atMs] (timeline time). */
     fun splitClip(id: Long, atMs: Long): Boolean {
-        val i = project.indexOfClip(id)
-        if (i < 0) return false
-        val c = project.clips[i]
-        if (atMs <= c.startMs || atMs >= c.endMs) return false
-        val cut = c.inMs + (atMs - c.startMs)
-        val left = c.copy(outMs = cut)
-        val right = c.copy(id = project.nextClipId++, startMs = atMs, inMs = cut)
+        val c = clip(id) ?: return false
+        val edits = ArrayList<Edit>()
+        if (!splitInto(c, atMs, edits)) return false
+        project.touchAudio()
+        history.push(CompoundEdit(edits))
+        return true
+    }
+
+    /**
+     * Splits [c] at [atMs], recording the edits. The pieces join seamlessly, so the left one keeps
+     * only the fade-in and the right one only the fade-out; both keep the volume line.
+     */
+    private fun splitInto(c: AudioClip, atMs: Long, edits: MutableList<Edit>): Boolean {
+        val i = project.indexOfClip(c.id)
+        if (i < 0 || atMs <= c.startMs || atMs >= c.endMs) return false
+        val cut = c.sourceMs(atMs)
+        val left = c.copy(outMs = cut, fadeOutMs = 0)
+        val right = c.copy(id = project.nextClipId++, startMs = atMs, inMs = cut, fadeInMs = 0)
         project.clips[i] = left
         project.clips.add(right)
-        project.touchAudio()
-        history.push(CompoundEdit(listOf(ChangeClipEdit(c, left), AddClipEdit(right))))
+        edits += ChangeClipEdit(c, left)
+        edits += AddClipEdit(right)
         return true
     }
 
@@ -890,6 +900,260 @@ class EditorEngine(val project: PixelProject, val store: CelStore) {
         project.tracks.removeAt(i)
         project.touchAudio()
         history.push(RemoveTrackEdit(i, t, removed))
+    }
+
+    // ---- Sound sections ----------------------------------------------------------------------
+    //
+    // A section is a time range [fromMs, toMs) on a set of tracks. Nothing here moves sound in
+    // time unless asked (close gap / insert silence), so the picture stays in sync. Every
+    // operation is one undo step.
+
+    /** Clips on [tracks] that overlap [fromMs, toMs). */
+    private fun clipsIn(tracks: Set<Long>, fromMs: Long, toMs: Long): List<AudioClip> =
+        project.clips.filter { it.trackId in tracks && it.startMs < toMs && it.endMs > fromMs }
+
+    /**
+     * The part of this clip inside [fromMs, toMs) (same id), or null. Its fades stay only where
+     * it keeps the clip's own edge; a new cut edge gets [cutFadeMs] to avoid a click.
+     */
+    private fun AudioClip.within(fromMs: Long, toMs: Long, cutFadeMs: Long = 0): AudioClip? {
+        val s = maxOf(startMs, fromMs)
+        val e = minOf(endMs, toMs)
+        if (e <= s) return null
+        return copy(
+            startMs = s, inMs = sourceMs(s), outMs = sourceMs(e),
+            fadeInMs = if (s == startMs) fadeInMs else cutFadeMs,
+            fadeOutMs = if (e == endMs) fadeOutMs else cutFadeMs,
+        )
+    }
+
+    /**
+     * Copies of the pieces of sound inside a section (ids unchanged), e.g. to duplicate or copy.
+     * Edges cut by the section get [cutFadeMs] fades.
+     */
+    fun piecesIn(tracks: Set<Long>, fromMs: Long, toMs: Long, cutFadeMs: Long = 0): List<AudioClip> =
+        clipsIn(tracks, fromMs, toMs).mapNotNull { it.within(fromMs, toMs, cutFadeMs) }
+
+    /** Removes the sound in a section, recording the edits; the edges left behind get de-click fades. */
+    private fun removeSection(tracks: Set<Long>, fromMs: Long, toMs: Long, edits: MutableList<Edit>) {
+        for (c in clipsIn(tracks, fromMs, toMs)) {
+            val i = project.indexOfClip(c.id)
+            val left = c.within(c.startMs, fromMs, DECLICK_MS)
+            val right = c.within(toMs, c.endMs, DECLICK_MS)
+            when {
+                left == null && right == null -> {
+                    project.clips.removeAt(i)
+                    edits += RemoveClipEdit(i, c)
+                }
+                left != null -> {
+                    project.clips[i] = left
+                    edits += ChangeClipEdit(c, left)
+                    if (right != null) {
+                        val r = right.copy(id = project.nextClipId++)
+                        project.clips.add(r)
+                        edits += AddClipEdit(r)
+                    }
+                }
+                else -> {
+                    project.clips[i] = right!!
+                    edits += ChangeClipEdit(c, right)
+                }
+            }
+        }
+    }
+
+    /** Moves every clip on [tracks] starting at or after [fromMs] by [deltaMs], recording the edits. */
+    private fun shiftFrom(tracks: Set<Long>, fromMs: Long, deltaMs: Long, edits: MutableList<Edit>) {
+        for (i in project.clips.indices) {
+            val c = project.clips[i]
+            if (c.trackId !in tracks || c.startMs < fromMs) continue
+            val moved = c.copy(startMs = (c.startMs + deltaMs).coerceAtLeast(0))
+            project.clips[i] = moved
+            edits += ChangeClipEdit(c, moved)
+        }
+    }
+
+    private fun pushSound(edits: List<Edit>): Boolean {
+        if (edits.isEmpty()) return false
+        project.touchAudio()
+        history.push(if (edits.size == 1) edits[0] else CompoundEdit(edits))
+        return true
+    }
+
+    /** Splits every clip on [tracks] that crosses [atMs]. */
+    fun splitAt(tracks: Set<Long>, atMs: Long): Boolean {
+        val edits = ArrayList<Edit>()
+        for (c in clipsIn(tracks, atMs, atMs + 1)) splitInto(c, atMs, edits)
+        return pushSound(edits)
+    }
+
+    /** Splits at both edges of a section, so it becomes clips of its own. */
+    fun splitSection(tracks: Set<Long>, fromMs: Long, toMs: Long): Boolean {
+        val edits = ArrayList<Edit>()
+        for (at in listOf(fromMs, toMs)) for (c in clipsIn(tracks, at, at + 1)) splitInto(c, at, edits)
+        return pushSound(edits)
+    }
+
+    /**
+     * Deletes the sound in a section. It leaves silence, so everything after stays in sync with
+     * the picture; with [closeGap] the sound after it on those tracks moves left to fill the gap.
+     */
+    fun deleteSection(tracks: Set<Long>, fromMs: Long, toMs: Long, closeGap: Boolean = false): Boolean {
+        if (toMs <= fromMs) return false
+        val edits = ArrayList<Edit>()
+        removeSection(tracks, fromMs, toMs, edits)
+        if (closeGap) shiftFrom(tracks, toMs, fromMs - toMs, edits)
+        return pushSound(edits)
+    }
+
+    /** Opens [lenMs] of silence at [atMs] on [tracks]: the sound from there on moves right. */
+    fun insertSilence(tracks: Set<Long>, atMs: Long, lenMs: Long): Boolean {
+        if (lenMs <= 0) return false
+        val edits = ArrayList<Edit>()
+        for (c in clipsIn(tracks, atMs, atMs + 1)) {
+            if (!splitInto(c, atMs, edits)) continue
+            // The two new edges face silence now: soften them.
+            val left = clip(c.id)!!
+            val right = project.clips.last()
+            changeInto(left, left.copy(fadeOutMs = maxOf(left.fadeOutMs, DECLICK_MS)), edits)
+            changeInto(right, right.copy(fadeInMs = maxOf(right.fadeInMs, DECLICK_MS)), edits)
+        }
+        shiftFrom(tracks, atMs, lenMs, edits)
+        return pushSound(edits)
+    }
+
+    /**
+     * Places [pieces] (clips with their own track, start and sound) on the timeline, replacing
+     * whatever sound they land on (nothing else moves). Returns the new clips.
+     */
+    fun placeOver(pieces: List<AudioClip>): List<AudioClip> {
+        val edits = ArrayList<Edit>()
+        val added = placeOverInto(pieces, edits)
+        pushSound(edits)
+        return added
+    }
+
+    private fun placeOverInto(pieces: List<AudioClip>, edits: MutableList<Edit>): List<AudioClip> {
+        for ((trackId, list) in pieces.groupBy { it.trackId }) {
+            removeSection(setOf(trackId), list.minOf { it.startMs }, list.maxOf { it.endMs }, edits)
+        }
+        return pieces.map { p ->
+            val c = p.copy(id = project.nextClipId++)
+            project.clips.add(c)
+            edits += AddClipEdit(c)
+            c
+        }
+    }
+
+    /** Copies a section to right after itself, over whatever sound is there. */
+    fun duplicateSection(tracks: Set<Long>, fromMs: Long, toMs: Long): List<AudioClip> {
+        // The copy jumps back to the section's start, so its cut edges get de-click fades too.
+        val pieces = piecesIn(tracks, fromMs, toMs, DECLICK_MS)
+        if (pieces.isEmpty()) return emptyList()
+        val len = toMs - fromMs
+        val edits = ArrayList<Edit>()
+        // Cover the whole destination (also its silent parts), then place the copies.
+        removeSection(tracks, toMs, toMs + len, edits)
+        val added = placeOverInto(pieces.map { it.copy(startMs = it.startMs + len) }, edits)
+        pushSound(edits)
+        return added
+    }
+
+    /**
+     * Multiplies the volume over a section by a straight ramp from [gainFrom] to [gainTo]
+     * (fade in: 0 → 1, fade out: 1 → 0, quieter or louder: g → g). A fade that starts at a
+     * clip's beginning (or ends at its end) becomes the clip's own fade; anything else goes on
+     * its volume line, with short ramps at the section's edges so nothing clicks.
+     */
+    fun scaleSection(tracks: Set<Long>, fromMs: Long, toMs: Long, gainFrom: Float, gainTo: Float): Boolean {
+        if (toMs <= fromMs) return false
+        val edits = ArrayList<Edit>()
+        for (c in clipsIn(tracks, fromMs, toMs)) {
+            val new = when {
+                gainFrom == 0f && gainTo == 1f && abs(fromMs - c.startMs) <= EDGE_SLOP_MS ->
+                    c.copy(fadeInMs = minOf(toMs, c.endMs) - c.startMs)
+                gainFrom == 1f && gainTo == 0f && abs(toMs - c.endMs) <= EDGE_SLOP_MS ->
+                    c.copy(fadeOutMs = c.endMs - maxOf(fromMs, c.startMs))
+                else -> c.copy(envelope = scaledEnvelope(c, fromMs, toMs, gainFrom, gainTo))
+            }
+            changeInto(c, new, edits)
+        }
+        return pushSound(edits)
+    }
+
+    /** The clip's volume line with a section multiplied by a ramp (see [scaleSection]). */
+    private fun scaledEnvelope(c: AudioClip, fromMs: Long, toMs: Long, gainFrom: Float, gainTo: Float): List<GainPoint> {
+        val gain = ClipGain(c.copy(volume = 1f, fadeInMs = 0, fadeOutMs = 0))
+        fun lineAt(srcMs: Long): Float = gain.atOffsetMs((srcMs - c.inMs).toDouble())
+        val a = c.sourceMs(maxOf(fromMs, c.startMs))
+        val b = c.sourceMs(minOf(toMs, c.endMs))
+        val s0 = c.sourceMs(fromMs).toDouble()
+        val s1 = c.sourceMs(toMs).toDouble()
+        fun ramp(s: Long): Float = (gainFrom + (gainTo - gainFrom) * ((s - s0) / (s1 - s0))).toFloat()
+        fun clamp(g: Float) = g.coerceIn(0f, MAX_CLIP_VOLUME)
+        val out = ArrayList<GainPoint>()
+        c.envelope.filterTo(out) { it.atMs < a - DECLICK_MS }
+        if (a > c.inMs && ramp(a) != 1f) out += GainPoint(a - DECLICK_MS, lineAt(a - DECLICK_MS))
+        out += GainPoint(a, clamp(lineAt(a) * ramp(a)))
+        c.envelope.filter { it.atMs in (a + 1) until b }.forEach { out += GainPoint(it.atMs, clamp(it.gain * ramp(it.atMs))) }
+        out += GainPoint(b, clamp(lineAt(b) * ramp(b)))
+        if (b < c.outMs && ramp(b) != 1f) out += GainPoint(b + DECLICK_MS, lineAt(b + DECLICK_MS))
+        c.envelope.filterTo(out) { it.atMs > b + DECLICK_MS }
+        return out.sortedBy { it.atMs }.distinctBy { it.atMs }
+    }
+
+    private fun changeInto(old: AudioClip, new: AudioClip, edits: MutableList<Edit>) {
+        if (old == new) return
+        val i = project.indexOfClip(old.id)
+        if (i < 0) return
+        project.clips[i] = new
+        edits += ChangeClipEdit(old, new)
+    }
+
+    /** Several engine calls become one undo step, e.g. split a section, then process it. */
+    fun beginGroup() = history.beginGroup()
+
+    fun endGroup() = history.endGroup()
+
+    /** Takes back everything since [beginGroup] (e.g. processing was cancelled). */
+    fun cancelGroup() {
+        history.cancelGroup(project, store)
+        project.touchAudio()
+    }
+
+    /** Clips on [tracks] lying entirely inside [fromMs, toMs) (after [splitSection], the section's pieces). */
+    fun clipsInside(tracks: Set<Long>, fromMs: Long, toMs: Long): List<AudioClip> =
+        project.clips.filter { it.trackId in tracks && it.startMs >= fromMs && it.endMs <= toMs }
+
+    /**
+     * Makes a clip play a processed copy of its sound (asset [newAssetId], [newDurationMs] long,
+     * made from the clip's in..out range). Fades and the volume line follow: [timeScale] is
+     * new length / old length, [reversed] mirrors them. One undo step.
+     */
+    fun useProcessedSound(clipId: Long, newAssetId: Long, newDurationMs: Long, timeScale: Double, reversed: Boolean): AudioClip? {
+        val c = clip(clipId) ?: return null
+        fun map(srcMs: Long): Long {
+            val rel = (srcMs - c.inMs).toDouble()
+            return ((if (reversed) c.durationMs - rel else rel) * timeScale).toLong()
+        }
+        val gain = ClipGain(c.copy(volume = 1f, fadeInMs = 0, fadeOutMs = 0))
+        val envelope = if (c.envelope.isEmpty()) emptyList() else {
+            // Keep the points inside the clip, plus its level at both ends.
+            val inside = c.envelope.filter { it.atMs > c.inMs && it.atMs < c.outMs }
+            val ends = listOf(
+                GainPoint(c.inMs, gain.atOffsetMs(0.0)),
+                GainPoint(c.outMs, gain.atOffsetMs(c.durationMs.toDouble())),
+            )
+            (inside + ends).map { GainPoint(map(it.atMs), it.gain) }.sortedBy { it.atMs }.distinctBy { it.atMs }
+        }
+        val new = c.copy(
+            assetId = newAssetId, inMs = 0, outMs = newDurationMs,
+            fadeInMs = ((if (reversed) c.fadeOutMs else c.fadeInMs) * timeScale).toLong(),
+            fadeOutMs = ((if (reversed) c.fadeInMs else c.fadeOutMs) * timeScale).toLong(),
+            envelope = envelope,
+        )
+        changeClip(new)
+        return new
     }
 
     /** Audio assets the project or its undo history refers to (for saving). */
@@ -983,3 +1247,9 @@ class EditorEngine(val project: PixelProject, val store: CelStore) {
     /** Frame the user sees (for callers that need the Frame object). */
     val currentFrame: Frame get() = project.frames[project.currentFrameIndex]
 }
+
+/** Short fades on edges where sound was cut away, so they don't click. */
+const val DECLICK_MS = 5L
+
+/** How close (ms) a section edge must be to a clip edge to count as that edge (e.g. for fades). */
+private const val EDGE_SLOP_MS = 20L

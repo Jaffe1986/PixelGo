@@ -19,8 +19,11 @@ import com.pixelgo.data.video.VideoShape
 import com.pixelgo.data.video.VideoSize
 import com.pixelgo.editor.AnimationSnapshot
 import com.pixelgo.editor.AudioMixer
+import com.pixelgo.editor.ClipGain
 import com.pixelgo.editor.MemoryCelStore
 import com.pixelgo.editor.MemoryPcm
+import com.pixelgo.editor.denoise.DenoiseStage
+import com.pixelgo.editor.denoise.RnnModel
 import com.pixelgo.model.AUDIO_RATE
 import com.pixelgo.model.AudioClip
 import com.pixelgo.model.SoundTrack
@@ -45,8 +48,9 @@ import kotlin.math.sqrt
 /**
  * On-device checks for the code that runs on Android's media codecs and audio output, which
  * the JVM tests can't reach: sound import (decoding + resampling), video export with sound,
- * and the preview playback clock. Nothing here touches the screen or the user's projects;
- * files go to the app's `cache/devtest` folder and are deleted afterwards.
+ * the preview playback clock, fades in exports, and the speed of the AI noise removal on a
+ * phone. Nothing here touches the screen or the user's projects; files go to the app's
+ * `cache/devtest` folder and are deleted afterwards.
  *
  * The test sounds (`assets/tone.*`) are the reference signal of [toneSample], encoded with
  * ffmpeg: `-c:a libmp3lame -b:a 128k` (44.1 kHz), `-c:a aac -b:a 128k` (48 kHz),
@@ -214,6 +218,97 @@ class MediaDeviceTest {
             assertNotNull("no output timestamps (voice-over alignment falls back)", first)
         } finally {
             player.stop()
+        }
+    }
+
+    // ---- Sound editing -----------------------------------------------------------------------
+
+    /**
+     * Fades and crossfades reach the exported video: a 1 kHz clip (0–1 s, 300 ms fade in) that
+     * a 500 Hz clip (0.8–1.75 s, 200 ms fade out) crossfades into. The level every 50 ms must
+     * match what [ClipGain] (unit-tested) says, so the export applies it, in time.
+     */
+    @Test
+    fun exportAppliesFadesAndCrossfades() {
+        fun sine(freq: Double) = MemoryPcm(ShortArray(2 * AUDIO_RATE) { (0.5 * 32767 * sin(2 * PI * freq * it / AUDIO_RATE)).roundToInt().toShort() }, 1)
+        val tracks = listOf(SoundTrack(1, "Music"))
+        val clips = listOf(
+            AudioClip(id = 1, trackId = 1, assetId = 1, startMs = 0, inMs = 0, outMs = 1000, fadeInMs = 300),
+            AudioClip(id = 2, trackId = 1, assetId = 2, startMs = 800, inMs = 0, outMs = 950, fadeOutMs = 200),
+        )
+        val sounds = mapOf(1L to sine(1000.0), 2L to sine(500.0))
+        val mixer = AudioMixer(tracks, clips) { sounds[it] }
+        val exporter = VideoExporter(greyAnimation(fps = 10, holds = IntArray(10) { 1 }), settings(VideoSize.P480), mixer, totalMs = 1750)
+        val left = decode(export(exporter, "fades.mp4")).left
+        val gains = ClipGain.all(tracks, clips)
+        var worst = 0.0
+        for (ms in 25..1725 step 50) {
+            // RMS over 10 ms (whole periods of both tones), measured and expected.
+            val from = ms * 48 - 240
+            var got = 0.0
+            var want = 0.0
+            for (i in from until from + 480) {
+                got += left[i].toDouble() * left[i]
+                for (c in clips) {
+                    val off = i / 48.0 - c.startMs
+                    if (off >= 0 && off < c.durationMs) want += 0.125 * gains.getValue(c.id).atOffsetMs(off).let { it * it }
+                }
+            }
+            got = sqrt(got / 480)
+            want = sqrt(want / 480)
+            val err = got - want
+            log("Fades at %4d ms: level %.3f, expected %.3f".format(Locale.US, ms, got, want))
+            worst = maxOf(worst, kotlin.math.abs(err))
+            assertEquals("level at $ms ms", want, got, 0.015 + 0.04 * want)
+        }
+        log("Fades and crossfades in the export: worst level error %.4f".format(Locale.US, worst))
+    }
+
+    /**
+     * AI noise removal speed: 60 s of mono and of stereo sound (a voice-like tone that comes and
+     * goes, over steady noise). Target: 60 s of mono in under 10 s. Also checks it works here.
+     */
+    @Test
+    fun noiseRemovalSpeed() {
+        val model = RnnModel(ctx.assets.open("rnnoise.bin").use { it.readBytes() })
+        val n = 60 * AUDIO_RATE
+        val rnd = java.util.Random(5)
+        val x = FloatArray(n) { i ->
+            val t = i.toDouble() / AUDIO_RATE
+            val voice = if (t % 2.0 < 0.6) (0.5 - 0.5 * cos(2 * PI * t / 0.6)) *
+                (0.2 * sin(2 * PI * 150 * t) + 0.1 * sin(2 * PI * 300 * t) + 0.05 * sin(2 * PI * 450 * t)) else 0.0
+            (voice + 0.03 * rnd.nextGaussian()).toFloat()
+        }
+        for (ch in 1..2) {
+            val input = if (ch == 1) x else FloatArray(n * 2) { x[it / 2] }
+            val out = FloatArray(n * ch)
+            var at = 0
+            val keep: (FloatArray, Int) -> Unit = { o, m -> System.arraycopy(o, 0, out, at, m * ch); at += m * ch }
+            val stage = DenoiseStage(ch, 1f, model)
+            val t0 = System.nanoTime()
+            var pos = 0
+            while (pos < n) {
+                val m = minOf(4800, n - pos)
+                stage.process(input.copyOfRange(pos * ch, (pos + m) * ch), m, keep)
+                pos += m
+            }
+            stage.flush(keep)
+            val sec = (System.nanoTime() - t0) / 1e9
+            assertEquals(n * ch, at)
+            // Noise on its own (1.0–1.9 s of every 2 s, after the first 10 s), before and after.
+            var before = 0.0
+            var after = 0.0
+            for (i in 10 * AUDIO_RATE until n) {
+                val t = i.toDouble() / AUDIO_RATE
+                if (t % 2.0 in 1.0..1.9) {
+                    before += x[i].toDouble() * x[i]
+                    after += out[i * ch].toDouble() * out[i * ch]
+                }
+            }
+            val reductionDb = 10 * kotlin.math.log10(before / maxOf(after, 1e-20))
+            log("Noise removal: 60 s of %s sound in %.2f s; noise %.1f dB quieter".format(Locale.US, if (ch == 1) "mono" else "stereo", sec, reductionDb))
+            assertTrue("noise only %.1f dB quieter".format(Locale.US, reductionDb), reductionDb > 15)
+            assertTrue("60 s took %.1f s".format(Locale.US, sec), sec < 10.0 * ch)
         }
     }
 

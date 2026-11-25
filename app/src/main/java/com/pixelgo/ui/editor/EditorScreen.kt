@@ -100,7 +100,8 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
     val engine = vm.engine ?: return
 
     val leave = { vm.save(); onBack() }
-    BackHandler(onBack = leave)
+    // In sound mode, Back leaves sound mode first.
+    BackHandler(onBack = { if (vm.soundMode) vm.enterSoundMode(false) else leave() })
     // Leaving the app: stop sound/recording (Android silences the mic in the background) and save.
     LifecycleEventEffect(Lifecycle.Event.ON_STOP) { vm.onBackgrounded() }
 
@@ -141,6 +142,13 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
             )
         },
     ) { padding ->
+        if (vm.soundMode) {
+            // Sound mode: the timeline fills the screen (the frame on screen shows in its header).
+            Surface(Modifier.fillMaxSize().padding(padding), color = MaterialTheme.colorScheme.surfaceContainer) {
+                Column(Modifier.fillMaxSize()) { TimelineView(vm, Modifier.weight(1f)) }
+            }
+            return@Scaffold
+        }
         Column(Modifier.fillMaxSize().padding(padding)) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
                 PixelCanvas(vm)

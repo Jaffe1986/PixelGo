@@ -36,6 +36,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -52,16 +53,26 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.pixelgo.editor.Timing
 import kotlin.math.roundToInt
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import com.pixelgo.model.MAX_CLIP_VOLUME
+import kotlin.math.roundToLong
 
 /** Record from the microphone: voice-over (with the animation playing) or straight here. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RecordSheet(vm: EditorViewModel, onDismiss: () -> Unit) {
+fun RecordSheet(vm: EditorViewModel, onDismiss: () -> Unit, punchIn: Boolean = false) {
     val context = LocalContext.current
     var voiceOver by remember { mutableStateOf(vm.frameCount > 1) }
     var countIn by remember { mutableStateOf(true) }
     var trackId by remember { mutableStateOf(vm.defaultRecordTrack()) }
-    val start = { vm.startRecording(voiceOver, countIn, trackId) }
+    val start = { if (punchIn) vm.startPunchIn(countIn) else vm.startRecording(voiceOver, countIn, trackId) }
+    // Re-recording closes by itself once the take is in place.
+    var started by remember { mutableStateOf(false) }
+    LaunchedEffect(vm.recordState) {
+        if (vm.recordState != RecordState.Idle) started = true
+        else if (punchIn && started) onDismiss()
+    }
     val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         if (ok) start() else Toast.makeText(context, "PixelGo needs the microphone to record", Toast.LENGTH_LONG).show()
     }
@@ -77,7 +88,29 @@ fun RecordSheet(vm: EditorViewModel, onDismiss: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             when (vm.recordState) {
-                RecordState.Idle -> {
+                RecordState.Idle -> if (punchIn) {
+                    val sel = vm.soundSel
+                    Text("Re-record the selection", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        if (sel == null) "Select a section first." else
+                            "Plays from 2 s before the selected ${"%.2f".format(java.util.Locale.US, (sel.toMs - sel.fromMs) / 1000.0)} s " +
+                                "while you record, stops a second after it, and replaces just that part.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("3-2-1 count-in (also lines the take up exactly)", modifier = Modifier.weight(1f))
+                        Switch(checked = countIn, onCheckedChange = { countIn = it })
+                    }
+                    Button(
+                        onClick = {
+                            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
+                            else permission.launch(Manifest.permission.RECORD_AUDIO)
+                        },
+                        enabled = sel != null,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935), contentColor = Color.White),
+                        modifier = Modifier.fillMaxWidth().height(52.dp),
+                    ) { Text("● Re-record", fontSize = 18.sp) }
+                } else {
                     Text("Record sound", style = MaterialTheme.typography.titleLarge)
                     Text("Track", style = MaterialTheme.typography.labelLarge)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -152,13 +185,17 @@ private fun ModeRow(selected: Boolean, title: String, detail: String, onClick: (
 /** Options for one sound clip. Every change is one undo step. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ClipSheet(vm: EditorViewModel, clipId: Long, onDismiss: () -> Unit) {
+fun ClipSheet(vm: EditorViewModel, clipId: Long, onDismiss: () -> Unit, onEffects: () -> Unit, onCleanup: () -> Unit) {
     vm.structureTick
     val clip = vm.clips().firstOrNull { it.id == clipId } ?: return
-    var volume by remember(clipId) { mutableFloatStateOf(clip.volume) }
+    var volume by remember(clipId, clip.volume) { mutableFloatStateOf(clip.volume) }
+    val maxFade = minOf(5_000L, clip.durationMs).toFloat()
+    var fadeIn by remember(clipId, clip.fadeInMs) { mutableFloatStateOf(clip.fadeInMs.toFloat().coerceAtMost(maxFade)) }
+    var fadeOut by remember(clipId, clip.fadeOutMs) { mutableFloatStateOf(clip.fadeOutMs.toFloat().coerceAtMost(maxFade)) }
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(
-            Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).navigationBarsPadding()
+                .padding(horizontal = 20.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(vm.assetName(clip.assetId), style = MaterialTheme.typography.titleLarge)
@@ -167,13 +204,27 @@ fun ClipSheet(vm: EditorViewModel, clipId: Long, onDismiss: () -> Unit) {
                     if (clip.inMs > 0 || clip.outMs < vm.assetDurationMs(clip.assetId)) "  (trimmed)" else "",
                 style = MaterialTheme.typography.bodyMedium,
             )
-            Text("Volume ${(volume * 100).roundToInt()}%", style = MaterialTheme.typography.labelLarge)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Volume ${(volume * 100).roundToInt()}%", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+                TextButton(onClick = { vm.normalizeClip(clip.id) }) { Text("Normalize") }
+            }
             Slider(
                 value = volume,
                 onValueChange = { volume = it },
                 onValueChangeFinished = { vm.changeClip(clip.copy(volume = volume)) },
-                valueRange = 0f..2f,
+                valueRange = 0f..MAX_CLIP_VOLUME,
             )
+            Text("Fade in ${fadeIn.roundToInt()} ms  ·  fade out ${fadeOut.roundToInt()} ms", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Slider(
+                    value = fadeIn, onValueChange = { fadeIn = it }, valueRange = 0f..maxFade, modifier = Modifier.weight(1f),
+                    onValueChangeFinished = { vm.changeClip(clip.copy(fadeInMs = fadeIn.roundToLong())) },
+                )
+                Slider(
+                    value = fadeOut, onValueChange = { fadeOut = it }, valueRange = 0f..maxFade, modifier = Modifier.weight(1f),
+                    onValueChangeFinished = { vm.changeClip(clip.copy(fadeOutMs = fadeOut.roundToLong())) },
+                )
+            }
             Text("Nudge (line it up with the picture)", style = MaterialTheme.typography.labelLarge)
             val frameMs = 1000L / vm.fps
             // Two even rows: whole frames, then fine steps.
@@ -188,8 +239,10 @@ fun ClipSheet(vm: EditorViewModel, clipId: Long, onDismiss: () -> Unit) {
                 }
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                TextButton(onClick = { vm.changeClip(clip.copy(startMs = vm.currentFrameMs())) }) { Text("Start at current frame") }
-                TextButton(onClick = { vm.splitClipAtCurrentFrame(clip.id) }) { Text("Split at current frame") }
+                TextButton(onClick = { vm.changeClip(clip.copy(startMs = vm.soundCursorMs())) }) { Text("Start at the cursor") }
+                TextButton(onClick = { vm.splitClipAtCurrentFrame(clip.id) }) { Text("Split at the cursor") }
+                TextButton(onClick = onEffects) { Text("Effects…") }
+                TextButton(onClick = onCleanup) { Text("Clean up noise (AI)…") }
                 TextButton(onClick = { vm.duplicateClip(clip.id) }) { Text("Duplicate") }
                 TextButton(onClick = { vm.deleteClip(clip.id); onDismiss() }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
             }

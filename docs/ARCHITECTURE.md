@@ -100,6 +100,13 @@ back on undo, so no pixel copies are kept, even across thousands of frames.
 - **Selection** (`Selection.kt`): selections are any shape. Copy and cut produce a `Clip`. `beginMove` lifts the pixels into a `Floating` (layer + frame uid + original values); `commitFloating` writes them down as **one** `PixelEdit`, and `cancelFloating` restores them.
 - **Frames:** add (before/after/end), duplicate (after or to end), delete, move, and holds, plus range operations: `deleteFrames`, `reverseFrames`, `moveFrames`, `setHolds`, `duplicateFramesJob`, `frameRange` (for the clipboard), and `pasteFramesJob`. Pasting maps layers by position, adds missing layers, and centers or crops other canvas sizes.
 - **Sound:** `newAssetId` / `addAsset` (files are registered after they're written), `addClip` (optionally on a new track), `setClipLive` + `commitClip` (live dragging = one undo step), `changeClip`, `splitClip`, `duplicateClip`, `deleteClip`, `addTrack`, `changeTrack`, `deleteTrack` (one undo step that brings the clips back too).
+- **Sound sections** (a time range on a set of tracks; each call is one `CompoundEdit`):
+  - **Cutting and pieces:** clips are split at the section's edges (`splitInto`), then the pieces inside are acted on. `piecesIn` returns copies of what's inside, with `DECLICK_MS` (5 ms) fades at cut edges so cuts never click.
+  - **Deleting:** `deleteSection(…, closeGap)` leaves a gap. With `closeGap` it also pulls everything later on those tracks left (a ripple delete). `insertSilence` pushes it right.
+  - **Copying in place:** `duplicateSection` puts a copy right after the section. `placeOver(pieces)` lays clips over a range, removing what was there (paste, punch-in).
+  - **Levels:** `scaleSection(from, to, gainFrom, gainTo)` writes volume-line points (fade in/out = 0→1 / 1→0, or a flat volume). A section that starts or ends at a clip's edge, within 20 ms, becomes that clip's fade instead.
+  - **Effects:** `useProcessedSound` points a clip at a processed copy of its sound, scaling or mirroring fades and the volume line to match.
+- **Grouping:** `beginGroup` / `endGroup` / `cancelGroup` make several engine calls one undo step. Applying effects uses this: split the section, then switch each piece to its new sound once the background work finishes. `cancelGroup` undoes everything done since `beginGroup` if that work fails.
 
 ### Undo system (`editor/History.kt`)
 - `Edit.undo/redo(project, store)`. **Edits are pushed after the change has already been applied.**
@@ -139,6 +146,25 @@ back on undo, so no pixel copies are kept, even across thousands of frames.
   - **Defaults:** recordings go to a new track if the selected one already has sound from the current frame on. Names don't repeat (`Names`).
   - Both stop on `ON_STOP`.
 - **Import:** `importAudio(uri)` runs `AudioDecoder` (background, progress overlay), then adds the asset and a clip at the current frame.
+- **Sound mode state:**
+  - `soundMode`, `soundTool` (Move / Select / Volume), `cursorMs`, and `soundSel` (tracks + from/to ms).
+  - `cursorMs` is the sound cursor in milliseconds; `soundCursorMs()` falls back to the current frame's start, and `selectFrame` resets it.
+  - Section actions (`splitAtCursor`, `deleteSelection`, `fadeSelection`…) are thin wrappers around the engine's section calls.
+- **Effects** (`applyEffects(clipId or selection, EffectSettings)`):
+  - On the UI thread: `beginGroup`, split the section, and pick new asset ids.
+  - On IO: render each piece's in..out range through `Effects.chain` with `SoundRender.process` into new `.pcm` + `.peaks` files, with progress.
+  - Back on the UI thread: `addAsset` + `useProcessedSound` per piece, then `endGroup`. On failure: `cancelGroup` and delete the new files.
+- **Noise cleanup:**
+  - It's `EffectSettings(denoise = strength)` through the same path. The `denoiser` makes a `DenoiseStage`.
+  - The weights (`assets/rnnoise.bin`) load lazily, on the first background use.
+  - `previewCleanup` renders up to 5 s (from the cursor, or the selection's start) into memory, raw or cleaned, and plays it with its own `PreviewPlayer`.
+  - `cleanupPreview` / `cleanupPreparing` drive the sheet's buttons.
+- **Sound clipboard:**
+  - `copySelection(cut)` mixes each selected track's section (clip volumes, fades and volume line, not track volume) with `SoundRender.mix` into `SoundClipboard`.
+  - `pasteSound()` imports those files as new assets and `placeOver`s them at the selection start or cursor, on the selected track and the ones below (adding tracks if needed). One undo step.
+- **Punch-in** (`startPunchIn`):
+  - Needs a selection on one track. It records like a voice-over from `PUNCH_PREROLL_MS` (2 s) before the section, and stops itself 1 s after the section ends.
+  - On stop, the take is lined up exactly like a voice-over (count-in). Only the section's part is `placeOver`ed, with 10 ms fades.
 - **Autosave:** 2 s after the last edit, and on `ON_STOP` and back. Postponed while busy.
 
 ---
@@ -163,6 +189,12 @@ It's one `Canvas` that draws **only what's visible**: the frames between `frameA
   | Pinch | Anywhere | Zooms around the fingers |
 - **Waveforms** come from `.peaks` files (10 ms min/max), drawn about every 2 dp.
 - **Animation end:** the area past the end of the animation is shaded. A green tint means the animation repeats there ("loop until the sound ends"); a dark shade means the sound is cut off there.
+- **Sound mode** (`vm.soundMode`; `EditorScreen` gives the timeline the whole screen, with `SoundModeHeader`, `SoundToolsRow` and `SoundSelectionBar` from `SoundModeBars.kt`):
+  - **Zoom and height:** `maxZoom` goes to 4 px per sample. Track height is `AppSettings.trackHeightDp` (40–240 dp); a pinch that's more vertical than horizontal changes it.
+  - **Waveforms:** drawn at `waveScale` (×1–×16), with real min/max shapes. Closer than the 10 ms peaks, they come from `WaveformCache`: 1-second blocks of samples, LRU, loaded on IO. At a few pixels per sample the waveform is the sample line itself.
+  - **Taps** set the cursor (snapped to frame starts and clip edges within 6 dp). With the Select tool a drag across rows makes `soundSel`, and its edges can be dragged.
+  - **Direct targets** (`soundTarget`) are checked before other gestures. They are fade handles (Move tool, top corners of a clip), volume-line points (Volume tool: drag to move, long-press to remove; a tap on a clip adds one), and selection edges. Live changes use `moveClipLive`, so a drag is one undo step.
+  - **Level drawing:** clips show fades and the volume line as `ClipGain` computes them (the same code the mixer uses), so what you see is what you hear.
 - **Playhead:** while playing it is drawn at `vm.playTick`, and the time readout shows it too, so it moves on past a repeating animation. The timeline scrolls to keep it on screen (`snapshotFlow`). When not playing, it marks the current frame.
 
 ---
@@ -181,7 +213,10 @@ It's one `Canvas` that draws **only what's visible**: the frames between `frameA
   - **Don't trim the encoder delay yourself.** The extractor's format carries `encoder-delay` / `encoder-padding` (MP3 LAME tags, MP4 edit lists), and the codec trims them itself because that format is passed to `configure`. Trimming again made MP3s start 13 ms early and AAC 21 ms early. `MediaDeviceTest` checks each format starts on time.
 - **Mixing** (`AudioMixer`):
   - Takes snapshots of the tracks and clips.
-  - Per clip: gain = clip volume × track volume; muted tracks are skipped and trims applied.
+  - Per clip, the gain comes from `ClipGain`; muted tracks are skipped and trims applied:
+    - clip volume (up to 4×) × track volume × volume line (`GainPoint`s in *source* ms, so they stay on the sound when the clip is trimmed or split, linear between points) × S-curve fades
+    - × **equal-power crossfades** where a clip starts inside the previous one on its track and ends after it
+    - Flat clips take a fast path.
   - Output is a hard-clamped 16-bit sum.
   - The same mixer feeds preview and export.
 - **Preview** (`PreviewPlayer`):
@@ -189,6 +224,20 @@ It's one `Canvas` that draws **only what's visible**: the frames between `frameA
   - A list of (written frame → timeline frame) segments handles looping.
   - The position comes from `AudioTrack.getTimestamp` (checked every 50 ms, interpolated with `nanoTime`), falling back to the playback head.
 - **Preview count-in:** `PreviewPlayer(…, preRoll)` writes the count-in before the timeline. `heardFrames()` drives the 3-2-1 display, and `outputDeviceType()` keys the saved correction.
+- **Effects** (`editor/audiofx/Effects.kt`, pure Kotlin):
+  - A `Stage` takes interleaved float frames and emits frames (the count can differ). `Effects.chain` builds, in order: noise removal, noise gate, EQ (low cut + bass/mid/treble biquads, RBJ formulas), time stretch, resample.
+  - **Speed and pitch:** pitch = WSOLA time stretch by pitch/speed, then a resample by the pitch ratio. Tape style = resample only.
+  - **WSOLA:** 40 ms windows, 20 ms hop, ±7.5 ms search. The output is centered so onsets don't move (tested to a few ms), and it starts on silence padding so the first window is whole.
+  - **Noise gate:** 5 ms lookahead, 60 ms hold, 40 ms close.
+  - **Rendering:** `SoundRender.process` streams a source range (optionally reversed) through the stages into a `PcmWriter`, with progress and cancel.
+- **AI noise removal** (`editor/denoise/RnNoise.kt`): a line-by-line Kotlin port of RNNoise v0.1.1 (xiph, BSD-3), running the original weights.
+  - **Weights:** `tools/rnnoise_weights.py` converts the C weight tables into `assets/rnnoise.bin`. The file is `RNN1` followed by 6 layers of int8 weights, read by `RnnModel`.
+  - **Signal path:** 48 kHz, 480-sample frames, input on RNNoise's 16-bit scale.
+  - **Analysis:** a mixed-radix FFT (960 points, forward unscaled; the 1/N is applied like the C code), 22 band energies + DCT features, pitch search and the pitch filter.
+  - **Network:** a GRU network gives per-band gains (and voice activity), interpolated and applied, then overlap-add.
+  - **`DenoiseStage`:** one RNNoise state per channel. It removes RNNoise's 480-sample delay, so the output lines up with the input and has exactly its length.
+  - **Strength** sets a gain floor of `10^(−2·strength)`, so 50% removes at most 20 dB; 100% = no floor.
+  - **Reference test:** `RnNoiseTest` compares with ffmpeg's `arnndn` running the same weights. ffmpeg's port skips the 1/N FFT scaling and feeds ±1 samples, so the reference is made with the input scaled by 32768/960 and the output scaled back (commands in `tools/rnnoise_reference.py`); then the two match to −75 dB.
 - **Recording** (`AudioRecorder`): an `AudioRecord` (source `MIC`) at 48 kHz mono feeds a `PcmWriter`. `getTimestamp(MONOTONIC)` gives a capture time for the first sample (`timestamped` says whether it's real), but it isn't trusted for sync; see the recording section in §4. It needs `RECORD_AUDIO`, which is requested on first use.
 
 ---
@@ -239,8 +288,9 @@ All project data is in app-private storage (`allowBackup` is off).
 | Gallery thumbnail (frame 1) | `files/projects/<id>/thumb.png` |
 | Original of a migrated project | `files/projects/<id>.pxg.bak` (deleted with the project) |
 | Palettes | `files/palettes.bin` |
-| Settings | SharedPreferences `pixelgo` (`active_palette`, `duplicate_to_end`) |
+| Settings | SharedPreferences `pixelgo` (`active_palette`, `duplicate_to_end`, `record_correction_<route>`, `wave_scale`, `track_height_dp`) |
 | Frame clipboard | `cache/frame_clipboard/` (manifest written last; checked before pasting) |
+| Sound clipboard | `cache/sound_clipboard/`: `<i>.pcm` + `.peaks` per track (48 kHz stereo), manifest `sound.meta` (`SCLP`, written last) |
 
 ### `project.meta` (format v3, `MetaSerializer`)
 ```
@@ -251,6 +301,7 @@ Body (deflate): tagged sections  int tag, int length, bytes   …  int 0
   2 LAYERS: n × (id, name, visible)
   3 FRAMES: n × (uid, hold)
   4 AUDIO : loopToAudio, next ids, tracks, assets, clips
+  5 AUDIO_LEVELS: n × (clipId, fadeInMs, fadeOutMs, m × (atMs, gain))   only clips that use them
 ```
 Readers skip unknown tags, so new sections don't need a migration. If the format ever has to
 change incompatibly: bump the version, keep reading old ones, and add tests.
@@ -276,7 +327,7 @@ At startup `ProjectRepository` runs `Migration.migrate`:
 
 ## 10. Testing
 
-- `./gradlew testDebugUnitTest` runs 86 JVM tests:
+- `./gradlew testDebugUnitTest` runs 113 JVM tests:
 
   | Suite | Covers |
   |---|---|
@@ -286,8 +337,11 @@ At startup `ProjectRepository` runs `Migration.migrate`:
   | `RangeTest` | Range ops, clipboard across projects, layer mapping, size fit |
   | `VideoTest` | Layout, BT.709 conversion and neutrality, chroma alignment, MOV patch |
   | `AudioTest` | Resampler pitch, length, alias rejection and alignment; mixer; PCM files and peaks; sound edits and undo; clips with an in-point; finding the count-in in a noisy, echoing recording (and not in noise); default names; loop-to-sound length; meta round trip |
+  | `SoundEditTest` | Fades (S-curve, shortened to fit), equal-power crossfades, the volume line staying on the sound; tag 5 round trip and old files; section edits (delete with soft edges, close gap, insert silence, duplicate, split) with undo; processed sound as one undo step, reversed levels; fade vs. volume line at clip edges |
+  | `EffectsTest` | Low cut and 3-band EQ responses; noise gate; slower keeps pitch, octave up keeps length, sounds stay on the beat, stretched sound starts at full level; tape style; reverse and channel count; neutral settings |
+  | `RnNoiseTest` | The FFT against a plain DFT; output vs. the ffmpeg reference (−60 dB required); noise removed with the voice kept; strength; stereo channels kept apart |
 - Engine, storage and media math are plain Kotlin and JVM-tested. Code using `MediaCodec`, `AudioTrack` or `AudioRecord` needs a device.
-- **On-device tests** (`app/src/androidTest/.../MediaDeviceTest.kt`, 10 tests; how to run them is in the README and CLAUDE.md, **never with `connectedAndroidTest`**, which uninstalls the app and deletes its projects). They use no screen and no projects; files go to `cache/devtest` and are deleted.
+- **On-device tests** (`app/src/androidTest/.../MediaDeviceTest.kt`, 12 tests; how to run them is in the README and CLAUDE.md, **never with `connectedAndroidTest`**, which uninstalls the app and deletes its projects). They use no screen and no projects; files go to `cache/devtest` and are deleted.
   - **The test signal:** one reference signal, a 1 kHz left / 500 Hz right burst from 0.5 s to 1.5 s with 2 ms fades.
     - It is generated in the test for WAV.
     - It is stored in `assets/` as MP3, AAC (.m4a), Opus and FLAC, made with ffmpeg; the commands are in the test's header.
@@ -297,6 +351,8 @@ At startup `ProjectRepository` runs `Migration.migrate`:
     - video export with sound: frame timing, sound sync with and without an edit list, MOV
     - holds at low fps, and 4K
     - the preview clock: real time, monotonic, timestamps available
+    - fades and crossfades in an exported video, against `ClipGain`, every 50 ms
+    - AI noise removal speed on the phone (60 s of mono and stereo; target under 10 s for mono) and that it still removes noise there
   - Add `-e keep true` to keep the exported videos, then pull them with `adb exec-out run-as com.pixelgo cat cache/devtest/export.mp4 > export.mp4`.
 - **Manual device checks** (use a separate, clearly named test project; see CLAUDE.md):
   - **Drawing:** pinch mid-stroke; move with select ✓/✕.

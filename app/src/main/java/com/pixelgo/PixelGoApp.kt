@@ -9,6 +9,8 @@ import com.pixelgo.data.FrameClipInfo
 import com.pixelgo.data.FrameClipboard
 import com.pixelgo.data.PaletteRepository
 import com.pixelgo.data.ProjectRepository
+import com.pixelgo.data.audio.SoundClipInfo
+import com.pixelgo.data.audio.SoundClipboard
 import java.io.File
 
 class PixelGoApp : Application() {
@@ -26,6 +28,13 @@ class PixelGoApp : Application() {
     /** What's on [frameClipboard] (null = nothing), observed by the UI. */
     var frameClipInfo by mutableStateOf<FrameClipInfo?>(null)
 
+    /** Sound copied in any project; paste works in every project. */
+    lateinit var soundClipboard: SoundClipboard
+        private set
+
+    /** What's on [soundClipboard] (null = nothing), observed by the UI. */
+    var soundClipInfo by mutableStateOf<SoundClipInfo?>(null)
+
     override fun onCreate() {
         super.onCreate()
         projects = ProjectRepository(this)
@@ -33,5 +42,7 @@ class PixelGoApp : Application() {
         settings = AppSettings(this)
         frameClipboard = FrameClipboard(File(cacheDir, "frame_clipboard"))
         frameClipInfo = frameClipboard.info()
+        soundClipboard = SoundClipboard(File(cacheDir, "sound_clipboard"))
+        soundClipInfo = soundClipboard.info()
     }
 }
