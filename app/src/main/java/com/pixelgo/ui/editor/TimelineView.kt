@@ -66,6 +66,9 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -89,6 +92,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
@@ -131,6 +138,8 @@ private const val FRAMES_DP = 64
 private const val ROW_DP = 40
 private const val ADD_ROW_DP = 36
 private const val MAX_VISIBLE_ROWS = 3
+/** Sound mode's track header column. */
+private const val HEADER_DP = 80
 
 /**
  * The animation timeline. Each frame's width is proportional to how long it's held.
@@ -170,6 +179,9 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
     var volumeTrack by remember { mutableLongStateOf(-1L) }
     val thumbs = remember { mutableStateMapOf<Long, ImageBitmap>() }
     val textMeasurer = rememberTextMeasurer()
+    val haptic = LocalHapticFeedback.current
+    // The frame start a dragged clip last snapped to (one tick per snap, not per move).
+    val lastSnap = remember { longArrayOf(-1L) }
     val scope = rememberCoroutineScope()
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importAudio(uri)
@@ -189,8 +201,13 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
     val maxZoom = if (vm.soundMode) 4f * AUDIO_RATE / fps else 140f * dp
     val endPad = 48f * dp
 
-    // Track rows: taller (and as many as fit) in sound mode; read live, gestures outlive compositions.
-    fun rowH(): Float = (if (vm.soundMode) vm.trackHeightDp else ROW_DP.toFloat()) * dp
+    // Track rows: in sound mode they share the free height (never shorter than the chosen track
+    // height); read live, gestures outlive compositions.
+    fun rowH(): Float {
+        if (!vm.soundMode) return ROW_DP * dp
+        val fill = (viewHeight - (RULER_DP + FRAMES_DP + ADD_ROW_DP) * dp) / max(1, vm.tracks().size)
+        return max(vm.trackHeightDp * dp, fill)
+    }
     fun rowsAreaH(): Float {
         val all = vm.tracks().size * rowH()
         return if (vm.soundMode) min(all, max(0f, viewHeight - (RULER_DP + FRAMES_DP + ADD_ROW_DP) * dp))
@@ -267,7 +284,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
         val track = ts.getOrNull(row) ?: return Hit.AddTrack
         // The name chip (top-left of the row); in tall rows the space under it is track area.
         val rowTop = audioTop + row * rowH() - vScroll
-        if (x < 72 * dp && y < rowTop + 4 * dp + min(rowH() - 8 * dp, 32 * dp) + 4 * dp) return Hit.TrackLabel(track, y)
+        if (!vm.soundMode && x < 72 * dp && y < rowTop + 4 * dp + min(rowH() - 8 * dp, 32 * dp) + 4 * dp) return Hit.TrackLabel(track, y)
         val ms = xToMs(x)
         val clip = vm.clips().lastOrNull { it.trackId == track.id && ms >= it.startMs && ms < it.endMs }
             ?: return Hit.TrackEmpty(track)
@@ -347,6 +364,14 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 .onSizeChanged {
                     viewWidth = it.width
                     viewHeight = it.height
+                }
+                .semantics {
+                    contentDescription = "Timeline, frame ${vm.frameIndex + 1} of ${vm.frameCount}" +
+                        if (tracks.isNotEmpty()) ", ${tracks.size} sound track${if (tracks.size == 1) "" else "s"}" else ""
+                    customActions = listOf(
+                        CustomAccessibilityAction("Previous frame") { if (vm.frameIndex > 0) vm.selectFrame(vm.frameIndex - 1); true },
+                        CustomAccessibilityAction("Next frame") { if (vm.frameIndex < vm.frameCount - 1) vm.selectFrame(vm.frameIndex + 1); true },
+                    )
                 }
                 .pointerInput(vm) {
                     var flingJob: Job? = null
@@ -515,7 +540,11 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                                                     is Hit.TrackLabel -> target.track.id
                                                     else -> original.trackId
                                                 }
-                                                original.copy(startMs = snapMs((original.startMs + dMs).coerceAtLeast(0)), trackId = trackId)
+                                                val raw = (original.startMs + dMs).coerceAtLeast(0)
+                                                val snapped = snapMs(raw)
+                                                if (snapped != raw && snapped != lastSnap[0]) haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+                                                lastSnap[0] = if (snapped != raw) snapped else -1L
+                                                original.copy(startMs = snapped, trackId = trackId)
                                             }
                                         }
                                         moved = true
@@ -564,7 +593,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                                             // Taller / shorter tracks.
                                             val before = abs(p0.previousPosition.y - p1.previousPosition.y)
                                             val now = abs(p0.position.y - p1.position.y)
-                                            if (before > 8 * dp) vm.setTrackHeight(vm.trackHeightDp * now / before)
+                                            if (before > 8 * dp) vm.setTrackHeight(rowH() / dp * now / before)
                                         } else {
                                             val z = ev.calculateZoom()
                                             val cx = ev.calculateCentroid().x
@@ -671,6 +700,56 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
         }
     }
 
+    /**
+     * Sound mode: the track names in a fixed column beside the lanes (so they never cover a
+     * waveform). Tap one for its menu. Rows line up with the canvas rows and scroll with them.
+     */
+    val trackHeaders: @Composable (Modifier) -> Unit = { modifier ->
+        val rowDp = (rowH() / dp).dp
+        val scrollDp = (vScroll / dp).dp
+        Box(modifier.background(Pg.Surface1).clipToBounds()) {
+            Text(
+                "Frames", style = Pg.Mark, color = Pg.Text2,
+                modifier = Modifier.padding(start = 10.dp, top = (RULER_DP + FRAMES_DP / 2 - 7).dp),
+            )
+            Column(Modifier.fillMaxWidth().offset(y = (RULER_DP + FRAMES_DP).dp - scrollDp)) {
+                tracks.forEachIndexed { ti, t ->
+                    val color = Pg.Tracks[ti % Pg.Tracks.size]
+                    val selected = vm.selectedTrackId == t.id
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(rowDp)
+                            .background(if (selected) Pg.AccentWeak else Color.Transparent)
+                            .clickable(onClickLabel = "Track options", role = Role.Button) {
+                                vm.selectedTrackId = t.id
+                                trackMenu = t.id
+                                trackMenuY = (RULER_DP + FRAMES_DP) * dp + ti * rowH() - vScroll + rowH() / 2
+                            }
+                            .semantics(mergeDescendants = true) {
+                                contentDescription = t.name + if (t.muted) ", muted" else ""
+                            },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            Modifier.padding(vertical = 6.dp).width(3.dp).fillMaxHeight()
+                                .background(if (t.muted) color.copy(alpha = 0.35f) else color, RoundedCornerShape(2.dp)),
+                        )
+                        Column(Modifier.padding(start = 8.dp, end = 4.dp)) {
+                            Text(
+                                t.name, style = MaterialTheme.typography.labelMedium,
+                                color = if (t.muted) Pg.Text3 else Pg.Text1,
+                                textDecoration = if (t.muted) TextDecoration.LineThrough else null,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            )
+                            if (t.muted) Icon(Icons.AutoMirrored.Filled.VolumeOff, null, tint = Pg.Text3, modifier = Modifier.size(14.dp))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Column(modifier.fillMaxWidth()) {
         if (vm.soundMode) {
             SoundModeHeader(
@@ -686,7 +765,7 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 val nz = (zoom * factor).coerceIn(minZoom, maxZoom)
                 zoom = nz
                 scroll = clampScroll(tickAt * nz - anchor)
-            })
+            }, onTrackHeight = { f -> vm.setTrackHeight(rowH() / dp * f) })
             if (vm.soundSel != null) {
                 SoundSelectionBar(
                     vm, onVolume = { showVolume = true }, onEffects = { effectsFor = SELECTION }, onCleanup = { cleanupFor = SELECTION },
@@ -694,7 +773,10 @@ fun TimelineView(vm: EditorViewModel, modifier: Modifier = Modifier) {
                 )
             }
             if (vm.rangeMode) RangeBar(vm, onHold = { holdTarget = -1 })
-            track(Modifier.fillMaxWidth().weight(1f))
+            Row(Modifier.fillMaxWidth().weight(1f)) {
+                trackHeaders(Modifier.width(HEADER_DP.dp).fillMaxHeight())
+                track(Modifier.weight(1f).fillMaxHeight())
+            }
         } else if (expanded) {
             TimelineHandle(expanded = true) { expandedSetting = it }
             Row(
@@ -1088,7 +1170,9 @@ private fun DrawScope.drawAudio(
                 }
             }
             // Track name chip (fixed at the left edge).
-            // Muted tracks: the name greyed out and struck through.
+            // Outside sound mode the name sits on a chip at the left of the row (sound mode has a
+            // header column instead). Muted tracks: the name greyed out and struck through.
+            if (sound) return@forEachIndexed
             val label = measurer.measure(
                 t.name.take(10),
                 if (t.muted) labelStyle.copy(color = Pg.Text3, textDecoration = TextDecoration.LineThrough) else labelStyle,

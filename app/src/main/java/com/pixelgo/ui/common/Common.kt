@@ -43,14 +43,24 @@ import kotlin.math.min
 val CheckerLight = Color(0xFFE6E6E6)
 val CheckerDark = Color(0xFFB4B4B4)
 
+/** A quiet checkerboard for thumbnails on dark cards (transparent pixels without the glare). */
+val CheckerQuietLight = Color(0xFF3A3A3A)
+val CheckerQuietDark = Color(0xFF313131)
+
 /**
  * Draws a transparency checkerboard inside [rect], only over the part that is within [clip].
  * Cells are aligned to the rect's top-left corner.
  */
-fun DrawScope.drawCheckerboard(rect: Rect, cell: Float, clip: Rect = Rect(Offset.Zero, size)) {
+fun DrawScope.drawCheckerboard(
+    rect: Rect,
+    cell: Float,
+    clip: Rect = Rect(Offset.Zero, size),
+    light: Color = CheckerLight,
+    dark: Color = CheckerDark,
+) {
     val visible = rect.intersect(clip)
     if (visible.isEmpty) return
-    drawRect(CheckerLight, visible.topLeft, visible.size)
+    drawRect(light, visible.topLeft, visible.size)
     val c0 = max(0, floor((visible.left - rect.left) / cell).toInt())
     val c1 = ceil((visible.right - rect.left) / cell).toInt()
     val r0 = max(0, floor((visible.top - rect.top) / cell).toInt())
@@ -64,7 +74,7 @@ fun DrawScope.drawCheckerboard(rect: Rect, cell: Float, clip: Rect = Rect(Offset
             val t = max(top, visible.top)
             val rr = min(left + cell, visible.right)
             val b = min(top + cell, visible.bottom)
-            if (rr > l && b > t) drawRect(CheckerDark, Offset(l, t), Size(rr - l, b - t))
+            if (rr > l && b > t) drawRect(dark, Offset(l, t), Size(rr - l, b - t))
         }
     }
 }

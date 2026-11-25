@@ -1,7 +1,10 @@
 package com.pixelgo.ui.palettes
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,43 +22,53 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInParent
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import com.pixelgo.PixelGoApp
-import com.pixelgo.data.PaletteRepository
-import com.pixelgo.editor.ColorMath
 import com.pixelgo.model.Palette
-import com.pixelgo.ui.common.ColorPickerDialog
+import com.pixelgo.ui.common.ColorPickerSheet
 import com.pixelgo.ui.common.ColorSwatch
 import com.pixelgo.ui.common.ConfirmDialog
-import com.pixelgo.ui.common.PgTextButton
+import com.pixelgo.ui.common.Hint
+import com.pixelgo.ui.common.PgIconButton
 import com.pixelgo.ui.common.SecondaryButton
-import com.pixelgo.ui.theme.Pg
 import com.pixelgo.ui.common.TextInputDialog
+import com.pixelgo.ui.theme.Pg
 
-/** What the color picker is currently editing. index == null means "add new color". */
+/** What the color picker is editing. index == null means "add a new color". */
 private data class ColorTarget(val paletteId: String, val index: Int?, val initial: Int)
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -66,13 +79,14 @@ fun PaletteScreen(onBack: () -> Unit) {
     var renaming by remember { mutableStateOf<Palette?>(null) }
     var deleting by remember { mutableStateOf<Palette?>(null) }
     var picking by remember { mutableStateOf<ColorTarget?>(null) }
-    var colorOptions by remember { mutableStateOf<Pair<Palette, Int>?>(null) }
 
     Scaffold(
+        containerColor = Pg.Background,
         topBar = {
             TopAppBar(
                 title = { Text("Palettes") },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                navigationIcon = { PgIconButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", onBack) },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Pg.Surface1),
             )
         },
         floatingActionButton = {
@@ -85,9 +99,10 @@ fun PaletteScreen(onBack: () -> Unit) {
     ) { padding ->
         LazyColumn(
             Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(12.dp, 12.dp, 12.dp, 96.dp),
+            contentPadding = PaddingValues(16.dp, 12.dp, 16.dp, 96.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            item { Hint("Tap a color to change it. Long-press and drag to move it.") }
             items(repo.palettes, key = { it.id }) { p ->
                 PaletteCard(
                     p,
@@ -96,7 +111,8 @@ fun PaletteScreen(onBack: () -> Unit) {
                     onRename = { renaming = p },
                     onDuplicate = { repo.duplicate(p.id) },
                     onDelete = { deleting = p },
-                    onColorClick = { i -> colorOptions = p to i },
+                    onColorClick = { i -> picking = ColorTarget(p.id, i, p.colors[i]) },
+                    onMove = { from, to -> repo.moveColor(p.id, from, to) },
                     onAddColor = { picking = ColorTarget(p.id, null, p.colors.lastOrNull() ?: 0xFF000000.toInt()) },
                 )
             }
@@ -121,22 +137,18 @@ fun PaletteScreen(onBack: () -> Unit) {
             repo.delete(p.id)
         }
     }
-    colorOptions?.let { (p, i) ->
-        ColorOptionsDialog(
-            repo, p, i,
-            onDismiss = { colorOptions = null },
-            onEdit = { colorOptions = null; picking = ColorTarget(p.id, i, p.colors[i]) },
-        )
-    }
     picking?.let { t ->
-        ColorPickerDialog(
+        ColorPickerSheet(
             initial = t.initial,
             recent = repo.recentColors,
+            title = if (t.index == null) "New color" else "Edit color",
+            confirmLabel = if (t.index == null) "Add" else "Save",
             onDismiss = { picking = null },
             onConfirm = { c ->
                 picking = null
                 if (t.index == null) repo.addColor(t.paletteId, c) else repo.setColor(t.paletteId, t.index, c)
             },
+            onDelete = t.index?.let { i -> { picking = null; repo.removeColor(t.paletteId, i) } },
         )
     }
 }
@@ -150,85 +162,116 @@ private fun PaletteCard(
     onDuplicate: () -> Unit,
     onDelete: () -> Unit,
     onColorClick: (Int) -> Unit,
+    onMove: (from: Int, to: Int) -> Unit,
     onAddColor: () -> Unit,
 ) {
     var menu by remember { mutableStateOf(false) }
-    val border = if (active) BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null
     OutlinedCard(
-        border = border ?: CardDefaults.outlinedCardBorder(),
+        border = if (active) BorderStroke(2.dp, Pg.Accent) else BorderStroke(1.dp, Pg.Outline),
         colors = CardDefaults.outlinedCardColors(containerColor = Pg.Surface2),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(12.dp)) {
+        Column(Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(p.name, style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "${p.colors.size} colors" + if (active) " · in use" else "",
+                        "${p.colors.size} colors" + if (active) "  ·  in use" else "",
                         style = MaterialTheme.typography.bodySmall, color = Pg.Text2,
                     )
                 }
                 if (!active) SecondaryButton("Use", onClick = onUse)
                 Box {
-                    IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, "Palette options") }
+                    PgIconButton(Icons.Filled.MoreVert, "Options for ${p.name}", { menu = true })
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(text = { Text("Rename") }, onClick = { menu = false; onRename() })
                         DropdownMenuItem(text = { Text("Duplicate") }, onClick = { menu = false; onDuplicate() })
-                        DropdownMenuItem(text = { Text("Delete") }, onClick = { menu = false; onDelete() })
+                        DropdownMenuItem(text = { Text("Delete", color = Pg.Danger) }, onClick = { menu = false; onDelete() })
                     }
                 }
             }
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.padding(top = 8.dp),
-            ) {
-                p.colors.forEachIndexed { i, c ->
-                    ColorSwatch(c, Modifier.clickable { onColorClick(i) }, size = 38.dp)
-                }
-                Card(
-                    onClick = onAddColor,
-                    modifier = Modifier.size(38.dp),
-                    shape = RoundedCornerShape(6.dp),
-                ) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Icon(Icons.Filled.Add, "Add color")
-                    }
-                }
-            }
+            ReorderableSwatches(p.colors, onColorClick, onMove, onAddColor, Modifier.padding(top = 12.dp, end = 12.dp))
         }
     }
 }
 
+/**
+ * The palette's colors. Tap one to edit it; long-press and drag it onto another place to move
+ * it there (TalkBack: "Move left" / "Move right" actions).
+ */
 @Composable
-private fun ColorOptionsDialog(
-    repo: PaletteRepository,
-    p: Palette,
-    index: Int,
-    onDismiss: () -> Unit,
-    onEdit: () -> Unit,
+private fun ReorderableSwatches(
+    colors: List<Int>,
+    onClick: (Int) -> Unit,
+    onMove: (from: Int, to: Int) -> Unit,
+    onAdd: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
-    val color = p.colors.getOrNull(index) ?: return
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        icon = { ColorSwatch(color, size = 48.dp) },
-        title = { Text(ColorMath.toHex(color)) },
-        text = {
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                AssistChip(onClick = onEdit, label = { Text("Edit") })
-                AssistChip(
-                    enabled = index > 0,
-                    onClick = { repo.moveColor(p.id, index, index - 1); onDismiss() },
-                    label = { Text("Move left") },
-                )
-                AssistChip(
-                    enabled = index < p.colors.lastIndex,
-                    onClick = { repo.moveColor(p.id, index, index + 1); onDismiss() },
-                    label = { Text("Move right") },
-                )
-                AssistChip(onClick = { repo.removeColor(p.id, index); onDismiss() }, label = { Text("Delete") })
-            }
-        },
-        confirmButton = { PgTextButton("Close", onClick = onDismiss) },
-    )
+    val bounds = remember { mutableStateMapOf<Int, Rect>() }
+    var dragging by remember { mutableIntStateOf(-1) }
+    var offset by remember { mutableStateOf(Offset.Zero) }
+    val currentColors by rememberUpdatedState(colors)
+    val move by rememberUpdatedState(onMove)
+    val click by rememberUpdatedState(onClick)
+    FlowRow(
+        modifier,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        colors.forEachIndexed { i, c ->
+            val lifted = dragging == i
+            ColorSwatch(
+                c,
+                Modifier
+                    .onGloballyPositioned { bounds[i] = it.boundsInParent() }
+                    .zIndex(if (lifted) 1f else 0f)
+                    .graphicsLayer {
+                        if (lifted) {
+                            translationX = offset.x
+                            translationY = offset.y
+                            scaleX = 1.15f
+                            scaleY = 1.15f
+                            shadowElevation = 12f
+                        }
+                    }
+                    .semantics {
+                        customActions = listOfNotNull(
+                            if (i > 0) CustomAccessibilityAction("Move left") { move(i, i - 1); true } else null,
+                            if (i < currentColors.lastIndex) CustomAccessibilityAction("Move right") { move(i, i + 1); true } else null,
+                        )
+                    }
+                    .pointerInput(i) { detectTapGestures(onLongPress = {}, onTap = { click(i) }) }
+                    .pointerInput(i) {
+                        detectDragGesturesAfterLongPress(
+                            onDragStart = { dragging = i; offset = Offset.Zero },
+                            onDragEnd = {
+                                val from = dragging
+                                val start = bounds[from]
+                                if (start != null) {
+                                    val center = start.center + offset
+                                    val target = bounds.filterKeys { it <= currentColors.lastIndex }
+                                        .minByOrNull { (it.value.center - center).getDistance() }?.key
+                                    if (target != null && target != from) move(from, target)
+                                }
+                                dragging = -1
+                                offset = Offset.Zero
+                            },
+                            onDragCancel = { dragging = -1; offset = Offset.Zero },
+                        ) { change, amount ->
+                            change.consume()
+                            offset += amount
+                        }
+                    },
+                size = 40.dp,
+            )
+        }
+        Box(
+            Modifier
+                .size(40.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(Pg.Surface3)
+                .clickable(onClickLabel = "Add color", onClick = onAdd),
+            contentAlignment = Alignment.Center,
+        ) { Icon(Icons.Filled.Add, "Add color", tint = Pg.Text1) }
+    }
 }

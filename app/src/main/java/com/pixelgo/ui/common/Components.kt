@@ -69,6 +69,8 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.isSpecified
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.path
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -176,8 +178,14 @@ fun PgIconButton(
             Icon(icon, label, Modifier.size(iconSize), tint = if (tint.isSpecified && enabled) tint else LocalContentColor.current)
         }
     } else {
+        val haptic = LocalHapticFeedback.current
         IconToggleButton(
-            checked = checked, onCheckedChange = { onClick() }, modifier = modifier, enabled = enabled,
+            checked = checked,
+            onCheckedChange = {
+                haptic.performHapticFeedback(if (it) HapticFeedbackType.ToggleOn else HapticFeedbackType.ToggleOff)
+                onClick()
+            },
+            modifier = modifier, enabled = enabled,
             colors = IconButtonDefaults.iconToggleButtonColors(
                 checkedContainerColor = Pg.AccentWeak, checkedContentColor = Pg.Accent,
             ),
@@ -215,12 +223,16 @@ fun ToolButton(
 ) {
     val bg = if (selected) Pg.Accent else Color.Transparent
     val fg = if (selected) Pg.OnAccent else Pg.Text2
+    val haptic = LocalHapticFeedback.current
     Column(
         modifier
             .heightIn(min = 48.dp)
             .clip(RoundedCornerShape(10.dp))
             .background(bg)
-            .selectable(selected = selected, onClick = onClick, role = Role.RadioButton)
+            .selectable(selected = selected, role = Role.RadioButton, onClick = {
+                if (!selected) haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+                onClick()
+            })
             .then(if (showLabel) Modifier else Modifier.semantics { contentDescription = label })
             .padding(vertical = 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -251,12 +263,16 @@ fun DockButton(
 ) {
     val bg = if (on) Pg.AccentWeak else Color.Transparent
     val fg = if (on) Pg.Accent else Pg.Text1
+    val haptic = LocalHapticFeedback.current
     Column(
         modifier
             .heightIn(min = 48.dp)
             .clip(RoundedCornerShape(10.dp))
             .background(bg)
-            .combinedClickable(onLongClickLabel = onLongClickLabel, onLongClick = onLongClick, role = Role.Button, onClick = onClick)
+            .combinedClickable(onLongClickLabel = onLongClickLabel, onLongClick = onLongClick, role = Role.Button, onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+                onClick()
+            })
             .semantics {
                 if (stateText != null) stateDescription = stateText
                 if (!showLabel) contentDescription = label
@@ -409,6 +425,7 @@ fun <T> Segmented(
     modifier: Modifier = Modifier,
     icon: ((T) -> ImageVector)? = null,
 ) {
+    val haptic = LocalHapticFeedback.current
     Row(
         modifier.clip(RoundedCornerShape(8.dp)).background(Pg.Surface3).padding(3.dp).selectableGroup(),
         horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -422,7 +439,10 @@ fun <T> Segmented(
                     .heightIn(min = 40.dp)
                     .clip(RoundedCornerShape(6.dp))
                     .background(if (on) Pg.Accent else Color.Transparent)
-                    .selectable(selected = on, onClick = { onSelect(o) }, role = Role.RadioButton)
+                    .selectable(selected = on, role = Role.RadioButton, onClick = {
+                        if (!on) haptic.performHapticFeedback(HapticFeedbackType.SegmentTick)
+                        onSelect(o)
+                    })
                     .padding(horizontal = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.Center,
@@ -453,12 +473,15 @@ fun PgSheet(
     actions: (@Composable RowScope.() -> Unit)? = null,
     footer: (@Composable RowScope.() -> Unit)? = null,
     scroll: Boolean = true,
+    /** How much the screen behind dims; lower where you need to see the art (color picker). */
+    scrimAlpha: Float = 0.32f,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         containerColor = Pg.Surface2,
+        scrimColor = Color.Black.copy(alpha = scrimAlpha),
     ) {
         Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
             Row(

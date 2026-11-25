@@ -1,49 +1,53 @@
 package com.pixelgo.ui.gallery
 
 import android.graphics.BitmapFactory
+import android.text.format.DateUtils
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Palette
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.outlined.GridOn
+import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material.icons.filled.MoreVert
-import com.pixelgo.ui.common.PgIconButton
-import com.pixelgo.ui.common.PgTextButton
-import com.pixelgo.ui.common.PrimaryButton
-import com.pixelgo.ui.theme.Pg
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -51,13 +55,17 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -65,13 +73,25 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.pixelgo.PixelGoApp
 import com.pixelgo.data.ProjectSummary
+import com.pixelgo.editor.Names
 import com.pixelgo.export.ExportJobs
 import com.pixelgo.model.MAX_CANVAS_SIZE
+import com.pixelgo.ui.common.CheckerQuietDark
+import com.pixelgo.ui.common.CheckerQuietLight
 import com.pixelgo.ui.common.ConfirmDialog
+import com.pixelgo.ui.common.Hint
+import com.pixelgo.ui.common.PgIconButton
+import com.pixelgo.ui.common.PgSheet
+import com.pixelgo.ui.common.PgTextButton
+import com.pixelgo.ui.common.PrimaryButton
+import com.pixelgo.ui.common.SectionLabel
 import com.pixelgo.ui.common.TextInputDialog
 import com.pixelgo.ui.common.drawCheckerboard
+import com.pixelgo.ui.theme.Pg
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
+import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -82,7 +102,7 @@ fun GalleryScreen(onOpen: (String) -> Unit, onPalettes: () -> Unit) {
     val repo = app.projects
     val scope = rememberCoroutineScope()
     var projects by remember { mutableStateOf<List<ProjectSummary>?>(null) }
-    var refreshKey by remember { mutableStateOf(0) }
+    var refreshKey by remember { mutableIntStateOf(0) }
     var showNew by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<ProjectSummary?>(null) }
     var deleting by remember { mutableStateOf<ProjectSummary?>(null) }
@@ -103,31 +123,31 @@ fun GalleryScreen(onOpen: (String) -> Unit, onPalettes: () -> Unit) {
     }
 
     Scaffold(
+        containerColor = Pg.Background,
         topBar = {
             TopAppBar(
                 title = { Text("PixelGo") },
-                actions = {
-                    IconButton(onClick = onPalettes) { Icon(Icons.Filled.Palette, "Palettes") }
-                },
+                actions = { PgIconButton(Icons.Outlined.Palette, "Palettes", onPalettes) },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Pg.Background),
             )
         },
         floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = { showNew = true },
-                icon = { Icon(Icons.Filled.Add, null) },
-                text = { Text("New project") },
-            )
+            if (projects?.isNotEmpty() == true) {
+                ExtendedFloatingActionButton(
+                    onClick = { showNew = true },
+                    icon = { Icon(Icons.Filled.Add, null) },
+                    text = { Text("New project") },
+                )
+            }
         },
     ) { padding ->
         val list = projects
         if (list != null && list.isEmpty()) {
-            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-                Text("No projects yet.\nTap New project to start drawing.", style = MaterialTheme.typography.bodyLarge)
-            }
+            EmptyGallery(Modifier.fillMaxSize().padding(padding)) { showNew = true }
         } else if (list != null) {
             LazyVerticalGrid(
-                columns = GridCells.Adaptive(150.dp),
-                contentPadding = PaddingValues(12.dp, 12.dp, 12.dp, 96.dp),
+                columns = GridCells.Adaptive(160.dp),
+                contentPadding = PaddingValues(16.dp, 8.dp, 16.dp, 96.dp),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 modifier = Modifier.fillMaxSize().padding(padding),
@@ -146,7 +166,8 @@ fun GalleryScreen(onOpen: (String) -> Unit, onPalettes: () -> Unit) {
     }
 
     if (showNew) {
-        NewProjectDialog(
+        NewProjectSheet(
+            defaultName = Names.numbered("Sprite", projects.orEmpty().map { it.name }),
             onDismiss = { showNew = false },
             onCreate = { name, w, h ->
                 showNew = false
@@ -174,7 +195,25 @@ fun GalleryScreen(onOpen: (String) -> Unit, onPalettes: () -> Unit) {
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+/** No projects yet: one clear way to start. */
+@Composable
+private fun EmptyGallery(modifier: Modifier, onNew: () -> Unit) {
+    Column(modifier.padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+        Icon(Icons.Outlined.GridOn, null, tint = Pg.Text3, modifier = Modifier.size(56.dp))
+        Spacer(Modifier.height(16.dp))
+        Text("No projects yet", style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.height(4.dp))
+        Hint("Start a sprite, an animation or a tileset.")
+        Spacer(Modifier.height(24.dp))
+        PrimaryButton("New project", onClick = onNew, icon = Icons.Filled.Add)
+    }
+}
+
+private fun editedLabel(modified: Long): String =
+    "Edited " + DateUtils.getRelativeTimeSpanString(modified, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS)
+        .toString().replaceFirstChar { it.lowercase(Locale.getDefault()) }
+
+/** A project: its art filling the tile, the name, size and length, when it was edited, and a menu. */
 @Composable
 private fun ProjectCard(
     p: ProjectSummary,
@@ -193,13 +232,15 @@ private fun ProjectCard(
         Modifier.combinedClickable(onClickLabel = "Open", onLongClickLabel = "Project options", onClick = onClick, onLongClick = { menu = true }),
         colors = CardDefaults.cardColors(containerColor = Pg.Surface2),
     ) {
-        Box(Modifier.fillMaxWidth().aspectRatio(1f).padding(8.dp)) {
-            Canvas(Modifier.fillMaxSize()) {
-                val s = min(size.width / p.width, size.height / p.height)
+        Box(Modifier.fillMaxWidth().aspectRatio(1f).background(Pg.Canvas)) {
+            Canvas(Modifier.fillMaxSize().padding(12.dp)) {
+                // Whole-pixel scaling when the art is smaller than the tile, like the editor.
+                var s = min(size.width / p.width, size.height / p.height)
+                if (s >= 1f) s = floor(s)
                 val w = p.width * s
                 val h = p.height * s
-                val rect = Rect(Offset((size.width - w) / 2, (size.height - h) / 2), androidx.compose.ui.geometry.Size(w, h))
-                drawCheckerboard(rect, 8.dp.toPx())
+                val rect = Rect(Offset((size.width - w) / 2, (size.height - h) / 2), Size(w, h))
+                drawCheckerboard(rect, maxOf(2f, min(w, h) / 8), light = CheckerQuietLight, dark = CheckerQuietDark)
                 thumb?.let {
                     drawImage(
                         it,
@@ -213,17 +254,16 @@ private fun ProjectCard(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f).padding(start = 12.dp, top = 8.dp, bottom = 10.dp)) {
                 Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
-                ExportJobs.state?.takeIf { it.projectId == p.id && !it.done }?.let {
-                    Text(
-                        "Exporting video… ${(it.progress * 100).toInt()}%",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
+                val export = ExportJobs.state?.takeIf { it.projectId == p.id && !it.done }
                 Text(
-                    "${p.width} × ${p.height}" +
-                        if (p.frameCount > 1) "  ·  ${p.frameCount} frames  ·  ${"%.1f".format(java.util.Locale.US, p.durationMs / 1000.0)} s" else "",
-                    style = MaterialTheme.typography.bodySmall, color = Pg.Text2,
+                    if (export != null) "Exporting video… ${(export.progress * 100).toInt()}%"
+                    else "${p.width} × ${p.height}" + if (p.frameCount > 1) "  ·  ${p.frameCount} frames" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (export != null) Pg.Accent else Pg.Text2,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    editedLabel(p.modified), style = MaterialTheme.typography.bodySmall, color = Pg.Text2,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                 )
             }
@@ -242,52 +282,68 @@ private fun ProjectCard(
     }
 }
 
+private val Presets = listOf(16, 32, 64, 128, 256)
+
+/** Name, then a size: the common squares as tiles, or any width and height. */
 @Composable
-private fun NewProjectDialog(onDismiss: () -> Unit, onCreate: (String, Int, Int) -> Unit) {
-    var name by remember { mutableStateOf("Untitled") }
+private fun NewProjectSheet(defaultName: String, onDismiss: () -> Unit, onCreate: (String, Int, Int) -> Unit) {
+    var name by remember { mutableStateOf(defaultName) }
     var w by remember { mutableStateOf("32") }
     var h by remember { mutableStateOf("32") }
     val wi = w.toIntOrNull()
     val hi = h.toIntOrNull()
     val valid = name.isNotBlank() && wi != null && hi != null && wi in 1..MAX_CANVAS_SIZE && hi in 1..MAX_CANVAS_SIZE
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("New project") },
-        text = {
-            Column {
-                OutlinedTextField(name, { name = it.take(40) }, label = { Text("Name") }, singleLine = true)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
-                    OutlinedTextField(
-                        w, { w = it.filter(Char::isDigit).take(3) }, label = { Text("Width") }, singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        modifier = Modifier.weight(1f),
-                    )
-                    OutlinedTextField(
-                        h, { h = it.filter(Char::isDigit).take(3) }, label = { Text("Height") }, singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-                Text(
-                    "1 – $MAX_CANVAS_SIZE pixels each side",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 4.dp),
-                )
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf(16, 32, 64, 128, 256).forEach { s ->
-                        FilterChip(
-                            selected = wi == s && hi == s,
-                            onClick = { w = "$s"; h = "$s" },
-                            label = { Text("$s") },
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
+    PgSheet(
+        title = "New project",
+        onDismiss = onDismiss,
+        footer = {
+            PgTextButton("Cancel", onClick = onDismiss)
             PrimaryButton("Create", onClick = { onCreate(name.trim(), wi!!, hi!!) }, enabled = valid)
         },
-        dismissButton = { PgTextButton("Cancel", onClick = onDismiss) },
-    )
+    ) {
+        OutlinedTextField(
+            name, { name = it.take(40) }, label = { Text("Name") }, singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        SectionLabel("Size")
+        Row(Modifier.selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Presets.forEach { s ->
+                val on = wi == s && hi == s
+                Column(
+                    Modifier
+                        .weight(1f)
+                        .heightIn(min = 72.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (on) Pg.AccentWeak else Pg.Surface3)
+                        .then(if (on) Modifier.border(2.dp, Pg.Accent, RoundedCornerShape(8.dp)) else Modifier)
+                        .selectable(selected = on, onClick = { w = "$s"; h = "$s" }, role = Role.RadioButton)
+                        .padding(vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    // A square that grows with the size, so the tiles read at a glance.
+                    val box = (10 + Presets.indexOf(s) * 5).dp
+                    Box(Modifier.size(32.dp), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(box).border(1.5.dp, if (on) Pg.Accent else Pg.Text2, RoundedCornerShape(2.dp)))
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text("$s", style = Pg.Data, color = if (on) Pg.Accent else Pg.Text1, textAlign = TextAlign.Center)
+                }
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                w, { w = it.filter(Char::isDigit).take(3) }, label = { Text("Width") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.weight(1f),
+            )
+            OutlinedTextField(
+                h, { h = it.filter(Char::isDigit).take(3) }, label = { Text("Height") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Hint("Any size from 1 to $MAX_CANVAS_SIZE pixels a side. Pixels stay sharp at every export size.")
+    }
 }

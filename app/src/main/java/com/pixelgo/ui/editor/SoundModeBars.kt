@@ -108,7 +108,7 @@ fun SoundModeHeader(vm: EditorViewModel, onRecord: () -> Unit, onImport: () -> U
 
 /** Sound mode, second row: what dragging does, zoom, and the view (waveform size, track height). */
 @Composable
-fun SoundToolsRow(vm: EditorViewModel, onZoom: (Float) -> Unit) {
+fun SoundToolsRow(vm: EditorViewModel, onZoom: (Float) -> Unit, onTrackHeight: (factor: Float) -> Unit) {
     Row(
         Modifier.fillMaxWidth().height(Pg.BarHeight).padding(horizontal = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -144,12 +144,12 @@ fun SoundToolsRow(vm: EditorViewModel, onZoom: (Float) -> Unit) {
                 DropdownMenuItem(
                     text = { Text("Taller tracks") },
                     leadingIcon = { Icon(Icons.Filled.UnfoldMore, null) },
-                    onClick = { vm.setTrackHeight(vm.trackHeightDp * 1.4f) },
+                    onClick = { onTrackHeight(1.4f) },
                 )
                 DropdownMenuItem(
                     text = { Text("Shorter tracks") },
                     leadingIcon = { Icon(Icons.Filled.UnfoldLess, null) },
-                    onClick = { vm.setTrackHeight(vm.trackHeightDp / 1.4f) },
+                    onClick = { onTrackHeight(1 / 1.4f) },
                 )
             }
         }

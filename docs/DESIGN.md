@@ -4,8 +4,9 @@ How PixelGo looks and behaves, and the rules for new screens. The tokens live in
 `ui/theme/Theme.kt` (object `Pg` + the Material theme) and the shared components in
 `ui/common/Components.kt`. Build from those; don't style Material components one by one.
 
-The direction came from a design audit (November 2026) that the owner approved. Phases 1
-(foundation) and 2 (editor shell) are built; phases 3 and 4 are listed at the end.
+The direction came from a design audit (November 2026) that the owner approved. All four phases
+are built: foundation, editor shell, flows (export, gallery, color picker, palettes, sound mode)
+and polish (haptics, motion, TalkBack, icon).
 
 ## Principles
 
@@ -75,6 +76,7 @@ separate surfaces; shadows only on things that float (menus, dragged items, FAB,
 | `SectionLabel`, `Hint` | Section headings; one-line explanations |
 | `PgSnackbarHost` | Snackbars (with Undo) |
 | `ColorSwatch` | A color with a checkerboard under it; the current one gets a yellow ring |
+| `ColorPickerSheet` | Picking a color in a lightly dimmed sheet (add to palette, delete) |
 | `mirrorIcon`, `OnionSkinIcon`, `EraserIcon` | Icons Material doesn't have |
 
 ## Interaction rules
@@ -101,11 +103,41 @@ separate surfaces; shadows only on things that float (menus, dragged items, FAB,
 - **Timeline header:** play, time, then onion skin, select frames, add, duplicate, sound mode.
   Record and import live in sound mode and the track menu; animation settings in ⋮.
 
-## Still to do
+## Flows (phase 3)
 
-- **Phase 3, flows:** an export sheet with a live preview and format tiles; the gallery (art
-  filling the tiles, numbered default names) and a new-project sheet; the color picker as a sheet
-  over the visible canvas; drag-to-reorder palette colors; sound mode with a fixed track header
-  column and rows that share the height.
-- **Phase 4, polish:** motion (150–200 ms, off with reduced motion) and haptics; empty states;
-  TalkBack labels and states on the timeline canvas; a launcher icon to match.
+- **Export** is a sheet (`ExportSheet`): a preview of the current frame at the output's real
+  shape (checkerboard for images, background and padding for video, the grid for a sprite
+  sheet), six format tiles (Image, Layers, GIF, Sprite sheet, Frames, Video; MP4 or MOV is chosen
+  inside Video), only that format's options, a one-line summary (pixels, frames, length, size)
+  and Save (or Export video) with Share beside it.
+- **Gallery:** the art fills each tile on a neutral ground (whole-pixel scaling, a quiet
+  checkerboard), with the size, frame count and "Edited …". Each card has a visible ⋮. New
+  projects are named "Sprite 1", "Sprite 2"…; the new-project sheet has size tiles and any
+  width and height. With no projects, an empty state with one New project button.
+- **Color picker** is a sheet (`ColorPickerSheet`) with a light dim, so the art stays readable
+  above it: old and new color side by side, recent colors, "Add to palette" (in the editor) and
+  a delete button (when editing a palette color).
+- **Palettes:** tap a color to edit it; long-press and drag to move it (TalkBack: Move left /
+  Move right actions).
+- **Sound mode:** track names sit in a fixed header column (color stripe, name, muted state), so
+  they never cover a waveform; tap one for its menu. Rows share the free height and are never
+  shorter than the chosen track height; pinch and "Taller tracks" start from the height they
+  really have.
+
+## Polish (phase 4)
+
+- **Haptics:** a light tick when the tool, a segmented choice or a dock button changes, on/off
+  ticks for toggles, and a tick when a dragged clip snaps to a frame.
+- **Motion:** the editor's bottom panel animates its height (180 ms) when the timeline grows or
+  bars appear. Compose follows the system's animation scale, so "remove animations" turns it off.
+- **TalkBack:** the timeline describes itself ("Timeline, frame 3 of 7, 2 sound tracks") and
+  offers Previous frame / Next frame; swatches, tools, toggles and track headers have labels and
+  states.
+- **Icon:** a stepped pixel play arrow in yellow on graphite (the notification icon's shape),
+  with a monochrome version for themed icons.
+
+## Ideas for later
+
+- A light surround option for the canvas (for dark art).
+- An export preview that plays the animation.
+- Per-frame semantics on the timeline (each frame as its own TalkBack item).

@@ -167,6 +167,7 @@ back on undo, so no pixel copies are kept, even across thousands of frames.
   - On stop, the take is lined up exactly like a voice-over (count-in). Only the section's part is `placeOver`ed, with 10 ms fades.
 - **Autosave:** 2 s after the last edit, and on `ON_STOP` and back. Postponed while busy.
 - **Undo offers:** `undoable(message) { … }` runs a delete and, if it added an undo step, shows "Deleted … · Undo" in `snackbar` (shown by `EditorScreen`). Undo only acts while that step is still `History.lastEdit`; any later edit withdraws the offer.
+- **Export** (`ExportSheet`): images are written by `PngExporter` (in the sheet, off the main thread); video goes to `ExportJobs` (below).
 - **Look and layout:** screens use the tokens in `ui/theme/Theme.kt` and the components in `ui/common/Components.kt` (see [DESIGN.md](DESIGN.md)). `EditorScreen` switches to rails beside the canvas when the screen is wider than tall.
 
 ---

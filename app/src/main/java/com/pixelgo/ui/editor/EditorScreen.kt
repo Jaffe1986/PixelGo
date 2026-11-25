@@ -2,6 +2,8 @@ package com.pixelgo.ui.editor
 
 import android.content.Intent
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -79,7 +81,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.pixelgo.PixelGoApp
 import com.pixelgo.export.ExportJobs
 import com.pixelgo.export.ExportState
-import com.pixelgo.ui.common.ColorPickerDialog
+import com.pixelgo.ui.common.ColorPickerSheet
 import com.pixelgo.ui.common.DockButton
 import com.pixelgo.ui.common.EraserIcon
 import com.pixelgo.ui.common.PgIconButton
@@ -167,7 +169,7 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
                 Column(Modifier.weight(1f).fillMaxHeight()) {
                     CanvasArea(vm, Modifier.weight(1f).fillMaxWidth())
                     if (vm.tool == Tool.Select) SelectionBar(vm)
-                    Surface(color = Pg.Surface1) { TimelineView(vm) }
+                    Surface(color = Pg.Surface1, modifier = Modifier.animateContentSize(tween(180))) { TimelineView(vm) }
                 }
                 Surface(color = Pg.Surface1, modifier = Modifier.fillMaxHeight().width(92.dp)) {
                     PaletteRail(vm, app.palettes, onEditCurrentColor = pickColor, onManagePalettes = onPalettes)
@@ -178,7 +180,7 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
                 CanvasArea(vm, Modifier.weight(1f).fillMaxWidth())
                 if (vm.tool == Tool.Select) SelectionBar(vm)
                 Surface(color = Pg.Surface1) {
-                    Column {
+                    Column(Modifier.animateContentSize(tween(180))) {
                         TimelineView(vm)
                         HorizontalDivider(color = Pg.Outline)
                         PaletteStrip(vm, app.palettes, onEditCurrentColor = pickColor, onManagePalettes = onPalettes)
@@ -218,14 +220,19 @@ fun EditorScreen(projectId: String, onBack: () -> Unit, onPalettes: () -> Unit) 
 
     if (showLayers) LayersSheet(vm, onDismiss = { showLayers = false })
     if (showPicker) {
-        ColorPickerDialog(
+        ColorPickerSheet(
             initial = vm.color,
             recent = app.palettes.recentColors,
             onDismiss = { showPicker = false },
             onConfirm = { showPicker = false; vm.pickColor(it) },
+            onAddToPalette = { c ->
+                showPicker = false
+                app.palettes.addColor(app.palettes.active.id, c)
+                vm.pickColor(c)
+            },
         )
     }
-    if (showExport) ExportDialog(vm, onDismiss = { showExport = false })
+    if (showExport) ExportSheet(vm, onDismiss = { showExport = false })
     if (showSettings) AnimationSettingsDialog(vm, onDismiss = { showSettings = false })
     if (renaming) {
         TextInputDialog("Rename project", vm.projectName, onDismiss = { renaming = false }) {
